@@ -1,6 +1,7 @@
 # doubao2api
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
 [![GitHub Stars](https://img.shields.io/github/stars/wangchuxiaoji-oss/doubao2api?style=social)](https://github.com/wangchuxiaoji-oss/doubao2api/stargazers)
 [![GitHub Forks](https://img.shields.io/github/forks/wangchuxiaoji-oss/doubao2api?style=social)](https://github.com/wangchuxiaoji-oss/doubao2api/network/members)
 [![GitHub Issues](https://img.shields.io/github/issues/wangchuxiaoji-oss/doubao2api)](https://github.com/wangchuxiaoji-oss/doubao2api/issues)
