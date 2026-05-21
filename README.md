@@ -2057,3 +2057,9 @@ doubao2api/
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=wangchuxiaoji-oss/doubao2api&type=Date)](https://star-history.com/#wangchuxiaoji-oss/doubao2api&Date)
+
+---
+
+## Keywords / 关键词
+
+doubao api, 豆包 api, 豆包逆向, doubao reverse engineer, openai compatible api, free chatgpt api, free multimodal api, ai agent tools, doubao chat api, bytedance doubao, 豆包免费接口, text to image api free, text to video api free, text to music api, doubao2api, coze alternative, 免费大模型 api, 智能体多模态, deepseek agent tools, python openai server
