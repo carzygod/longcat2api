@@ -41,7 +41,7 @@ from .client import (
     UploadedFile,
     VideoGenerationResult,
 )
-from .session import load_cookies
+from .session import load_session
 
 log = logging.getLogger("doubao_unified")
 
@@ -469,7 +469,9 @@ def create_app(
         session_file = os.environ.get(
             "DOUBAO_SESSION_FILE", ".doubao_session.json",
         )
-        cookies = load_cookies(session_file)
+        session_data = load_session(session_file)
+        cookies = session_data["cookies"]
+        params = session_data["params"]
 
         if not cookies.get("sessionid"):
             raise HTTPException(
@@ -484,16 +486,24 @@ def create_app(
         bot_id = os.environ.get("DOUBAO_BOT_ID", "7338286299411103781")
         timeout = int(os.environ.get("DOUBAO_TIMEOUT", "180"))
 
+        # Use device params from session if available
+        device_id = params.get("device_id") or "714003710229497"
+        web_id = params.get("web_id") or "7604137868021548590"
+        fp = params.get("fp") or "verify_mlcfw5f7_TPq0YmFD_NrsC_4RuQ_BJPg_M5W7i58I7wV0"
+
         client = DoubaoChatClient(
             cookies=cookies,
             ms_token=ms_token,
+            device_id=device_id,
+            web_id=web_id,
+            fp=fp,
             bot_id=bot_id,
             timeout_seconds=timeout,
         )
         await client.__aenter__()
         _client_holder["client"] = client
         _client_holder["created_at"] = time.time()
-        log.info("Client created/refreshed successfully")
+        log.info("Client created/refreshed (device_id=%s, fp=%s...)", device_id, fp[:20])
         return client
 
     async def _refresh_client() -> DoubaoChatClient:
@@ -1001,6 +1011,7 @@ def create_app(
                 data = {
                     "cookies": result.cookies,
                     "sessionid": result.sessionid,
+                    "params": result.device_params,
                     "timestamp": int(time.time()),
                     "source": "qr_login",
                 }

@@ -1,37 +1,38 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" class="scroll-smooth">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>doubao2api - 免费多模态 AI API for Agents</title>
-<meta name="description" content="逆向豆包(Doubao) API，为 AI 智能体提供免费的多模态对话、图片/视频/音乐生成、文件上传。OpenAI 兼容接口。">
-<meta name="keywords" content="doubao, 豆包, API, OpenAI, 逆向, AI Agent, 多模态, 免费, 文生图, 文生视频, 文生音乐, Python, FastAPI">
-<meta property="og:title" content="doubao2api - 免费多模态 AI API">
-<meta property="og:description" content="逆向豆包客户端 API，为 AI 智能体提供免费多模态能力。支持对话、识图、文件理解、图片/视频/音乐生成。">
+<meta name="description" content="逆向豆包(Doubao)客户端 API，为 AI 智能体提供免费的多模态对话、图片/视频/音乐生成、文件上传。OpenAI 兼容接口，即插即用。">
+<meta name="keywords" content="doubao, 豆包, API, OpenAI, 逆向, AI Agent, 多模态, 免费, 文生图, 文生视频, 文生音乐, Python, FastAPI, bytedance, 字节跳动">
+<meta property="og:title" content="doubao2api - 免费多模态 AI API for Agents">
+<meta property="og:description" content="逆向豆包客户端 API，为 AI 智能体提供免费多模态能力。支持对话、识图、文件理解、图片/视频/音乐生成。OpenAI 兼容。">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://wangchuxiaoji-oss.github.io/doubao2api">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        dark: { 900: '#0d1117', 800: '#161b22', 700: '#21262d', 600: '#30363d' },
+        accent: { blue: '#58a6ff', green: '#238636', purple: '#8b5cf6', orange: '#f97316' }
+      }
+    }
+  }
+}
+</script>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0d1117;color:#e6edf3;line-height:1.6}
-.container{max-width:800px;margin:0 auto;padding:60px 20px}
-h1{font-size:2.5em;margin-bottom:10px}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+body { font-family: 'Inter', system-ui, sans-serif; }
+code, pre { font-family: 'JetBrains Mono', monospace; }
+.gradient-text { background: linear-gradient(135deg, #58a6ff 0%, #8b5cf6 50%, #f97316 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+.card-hover { transition: transform 0.2s, box-shadow 0.2s; }
+.card-hover:hover { transform: translateY(-4px); box-shadow: 0 12px 40px rgba(88,166,255,0.1); }
+.fade-in { animation: fadeIn 0.6s ease-out; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+pre { overflow-x: auto; }
 </style>
 </head>
-<body>
-<div class="container">
-<h1>doubao2api</h1>
-<p style="font-size:1.2em;color:#8b949e;margin-bottom:30px">逆向豆包客户端 API，为 AI 智能体提供免费的多模态能力</p>
-<div style="margin-bottom:30px">
-<a href="https://github.com/wangchuxiaoji-oss/doubao2api" style="display:inline-block;padding:12px 24px;background:#238636;color:#fff;text-decoration:none;border-radius:6px;font-size:1.1em">GitHub 仓库</a>
-</div>
-<h2 style="margin:30px 0 15px;color:#58a6ff">功能</h2>
-<ul style="list-style:none;padding:0">
-<li style="padding:8px 0;border-bottom:1px solid #21262d">&#x1f4ac; 多模态对话 - 多轮对话、深度思考、联网搜索</li>
-<li style="padding:8px 0;border-bottom:1px solid #21262d">&#x1f441; 多模态理解 - 识图、读 PDF/Word/Excel/代码等 60+ 格式</li>
-<li style="padding:8px 0;border-bottom:1px solid #21262d">&#x1f3a8; 图片生成 - 文生图、图生图</li>
-<li style="padding:8px 0;border-bottom:1px solid #21262d">&#x1f3ac; 视频生成 - Seedance 2.0</li>
-<li style="padding:8px 0;border-bottom:1px solid #21262d">&#x1f3b5; 音乐生成 - 文本描述 + 歌词</li>
-</ul>
-</div>
-</body>
-</html>
+<body class="bg-dark-900 text-gray-200 antialiased">

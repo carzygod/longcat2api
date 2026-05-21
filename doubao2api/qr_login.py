@@ -16,7 +16,9 @@ Flow:
 import base64
 import json
 import logging
+import random
 import ssl
+import string
 import threading
 import time
 import urllib.error
@@ -32,15 +34,39 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://www.doubao.com"
 AID = 497858
 
+# Current Chrome version — keep in sync with client.py UA
+CHROME_VERSION = "148.0.0.0"
+CHROMIUM_BUILD = "148.0.7816.0"
+
 BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+        f"(KHTML, like Gecko) Chrome/{CHROME_VERSION} Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://www.doubao.com/chat/login",
     "Origin": "https://www.doubao.com",
 }
+
+
+def generate_device_params() -> Dict[str, str]:
+    """Generate fresh device fingerprint parameters.
+
+    Each QR login creates a new "device identity" to avoid
+    inheriting risk scores from previous sessions.
+    """
+    chars = string.ascii_letters + string.digits
+    fp_parts = [
+        "".join(random.choices(chars, k=8)),
+        "".join(random.choices(chars, k=4)),
+        "".join(random.choices(chars, k=4)),
+        "".join(random.choices(chars, k=4)),
+        "".join(random.choices(chars, k=12)),
+    ]
+    fp = "verify_" + "_".join(fp_parts)
+    device_id = str(random.randint(7000000000000000, 7999999999999999))
+    web_id = str(random.randint(7600000000000000000, 7699999999999999999))
+    return {"fp": fp, "device_id": device_id, "web_id": web_id}
 
 
 class QRStatus(Enum):
@@ -63,6 +89,7 @@ class QRResult:
     qrcode_data: bytes = b""
     cookies: Dict[str, str] = field(default_factory=dict)
     sessionid: str = ""
+    device_params: Dict[str, str] = field(default_factory=dict)
     error: str = ""
 
 
@@ -382,6 +409,7 @@ class QRLogin:
                     elif qr_status == "confirmed":
                         result.status = QRStatus.CONFIRMED
                         result.cookies = dict(session_cookies)
+                        result.device_params = generate_device_params()
                         if on_status:
                             on_status(QRStatus.CONFIRMED, "登录成功")
 

@@ -379,7 +379,7 @@ class DoubaoChatClient:
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/135.0.0.0 Safari/537.36"
+                    "Chrome/148.0.0.0 Safari/537.36"
                 ),
                 "Content-Type": "application/json",
                 "Origin": "https://www.doubao.com",
@@ -439,7 +439,7 @@ class DoubaoChatClient:
             "pkg_type": "release_version",
             "version_code": "20800",
             "pc_version": "2.1.7",
-            "chromium_version": "135.0.7049.72",
+            "chromium_version": "148.0.7816.0",
             "client_platform": "pc_client",
             "runtime": "web",
             "runtime_version": "3.5.4",
