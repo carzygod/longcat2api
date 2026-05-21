@@ -1,5 +1,11 @@
 # doubao2api
 
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![GitHub Stars](https://img.shields.io/github/stars/wangchuxiaoji-oss/doubao2api?style=social)](https://github.com/wangchuxiaoji-oss/doubao2api/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/wangchuxiaoji-oss/doubao2api?style=social)](https://github.com/wangchuxiaoji-oss/doubao2api/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/wangchuxiaoji-oss/doubao2api)](https://github.com/wangchuxiaoji-oss/doubao2api/issues)
+[![GitHub Last Commit](https://img.shields.io/github/last-commit/wangchuxiaoji-oss/doubao2api)](https://github.com/wangchuxiaoji-oss/doubao2api/commits/main)
+
 逆向工程豆包（Doubao）API，提供完整可用的 Python 异步客户端和 OpenAI 兼容 REST 服务。支持多轮对话（含深度思考/联网搜索）、图片生成、视频生成、音乐生成、文件上传，以及 QR 扫码登录和自动验证码处理。
 
 ## 原理
