@@ -22,6 +22,8 @@ venv/
 doubao_qr_login.png
 server_out.txt
 server_err.txt
+testpic.webp
+*.test.*
 
 # OS
 Thumbs.db
