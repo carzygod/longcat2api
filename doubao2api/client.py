@@ -2123,7 +2123,9 @@ class DoubaoChatClient:
             "Authorization": tos_auth,
             "Content-CRC32": crc32,
         }
-        async with aiohttp.ClientSession() as tos_session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
+        ) as tos_session:
             async with tos_session.post(
                 upload_url, data=file_data, headers=upload_headers
             ) as resp:
