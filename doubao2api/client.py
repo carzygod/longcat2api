@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import aiohttp
 
+from .qr_login import CHROME_VERSION, CHROMIUM_BUILD
 from .sse import iter_sse_events
 
 log = logging.getLogger(__name__)
@@ -379,7 +380,7 @@ class DoubaoChatClient:
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/148.0.0.0 Safari/537.36"
+                    f"Chrome/{CHROME_VERSION} Safari/537.36"
                 ),
                 "Content-Type": "application/json",
                 "Origin": "https://www.doubao.com",
@@ -439,7 +440,7 @@ class DoubaoChatClient:
             "pkg_type": "release_version",
             "version_code": "20800",
             "pc_version": "2.1.7",
-            "chromium_version": "148.0.7816.0",
+            "chromium_version": CHROMIUM_BUILD,
             "client_platform": "pc_client",
             "runtime": "web",
             "runtime_version": "3.5.4",

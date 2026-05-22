@@ -36,7 +36,7 @@ AID = 497858
 
 # Current Chrome version — keep in sync with client.py UA
 CHROME_VERSION = "148.0.0.0"
-CHROMIUM_BUILD = "148.0.7816.0"
+CHROMIUM_BUILD = "148.0.7816.0"  # used by client.py _security_params
 
 BASE_HEADERS = {
     "User-Agent": (

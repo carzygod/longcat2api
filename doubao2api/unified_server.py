@@ -464,7 +464,6 @@ def create_app(
                 pass
 
         ms_token: Optional[str] = os.environ.get("DOUBAO_MS_TOKEN")
-        cookies: Optional[Dict[str, str]] = None
 
         session_file = os.environ.get(
             "DOUBAO_SESSION_FILE", ".doubao_session.json",
@@ -476,7 +475,10 @@ def create_app(
         if not cookies.get("sessionid"):
             raise HTTPException(
                 status_code=500,
-                detail="No sessionid in session file. Use QR login or /v1/session/update.",
+                detail=(
+                    "No sessionid found. Session file may be missing or invalid. "
+                    "Use QR login (POST /v1/session/qr-login) or /v1/session/update."
+                ),
             )
 
         # Try to get msToken from cookies (optional, API works without it)

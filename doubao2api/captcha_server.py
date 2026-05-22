@@ -110,7 +110,7 @@ function renderCaptcha(params) {
       env: {
         h5_check_version: '4.0.16',
         product_host: 'https://www.doubao.com',
-        vc_version: '1.0.0.284'
+        vc_version: '1.0.0.739'
       },
       successCb: function(result) {
         log('SUCCESS! result=' + JSON.stringify(result));
