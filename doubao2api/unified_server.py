@@ -58,6 +58,62 @@ ALL_MODELS = [
 ]
 
 
+# ── Expert Mode Quota Tracker ──
+class ExpertQuotaTracker:
+    """Detects when expert mode is silently downgraded and falls back to think."""
+
+    def __init__(self, consecutive_threshold: int = 2, retry_interval: int = 1800):
+        self._no_reasoning_count = 0  # consecutive expert requests without reasoning
+        self._threshold = consecutive_threshold  # how many before marking degraded
+        self._degraded = False
+        self._last_retry_time = 0.0
+        self._retry_interval = retry_interval  # seconds before retrying expert (30 min)
+
+    @property
+    def is_degraded(self) -> bool:
+        """True if expert mode appears to be quota-limited."""
+        if not self._degraded:
+            return False
+        # Periodically retry
+        import time
+        if time.time() - self._last_retry_time > self._retry_interval:
+            return False  # Allow a retry
+        return True
+
+    def report_response(self, had_reasoning: bool):
+        """Call after each expert-mode request with whether reasoning was present."""
+        import time
+        if had_reasoning:
+            self._no_reasoning_count = 0
+            if self._degraded:
+                log.info("Expert mode recovered (reasoning detected)")
+            self._degraded = False
+        else:
+            self._no_reasoning_count += 1
+            if self._no_reasoning_count >= self._threshold and not self._degraded:
+                self._degraded = True
+                self._last_retry_time = time.time()
+                log.warning("Expert mode appears degraded (no reasoning for %d requests), falling back to think", self._threshold)
+
+    def mark_retry(self):
+        """Mark that we're doing a retry probe."""
+        import time
+        self._last_retry_time = time.time()
+
+    def get_effective_mode(self, requested_deep_think: int) -> tuple[int, str]:
+        """Return (deep_think_value, model_name) considering degradation.
+
+        If expert (3) is degraded, falls back to think (1).
+        """
+        if requested_deep_think == 3 and self.is_degraded:
+            return 1, "doubao-think"
+        model_map = {0: "doubao", 1: "doubao-think", 3: "doubao-expert"}
+        return requested_deep_think, model_map.get(requested_deep_think, "doubao")
+
+
+_expert_tracker = ExpertQuotaTracker()
+
+
 def _size_to_ratio(size):
     """Convert OpenAI size format to Doubao ratio."""
     if not size:
@@ -387,6 +443,7 @@ def create_app(
             result["consecutive_failures"] = client.consecutive_failures
             result["needs_captcha"] = client.needs_captcha
             result["last_error_code"] = client.last_error_code
+        result["expert_degraded"] = _expert_tracker.is_degraded
         return result
 
     @app.get("/v1/models")
@@ -401,9 +458,9 @@ def create_app(
         # ── Tool calling mode ──
         has_tools = bool(body.tools)
         if has_tools:
-            # Force expert model for tool calling
-            use_deep_think = CHAT_MODELS["doubao-expert"]
-            model_name = "doubao-expert"
+            # Use expert model for tool calling, with auto-fallback to think if degraded
+            requested_deep_think = CHAT_MODELS["doubao-expert"]
+            use_deep_think, model_name = _expert_tracker.get_effective_mode(requested_deep_think)
             # Convert messages with tool definitions injected
             messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
             prompt = convert_messages_with_tools(messages_raw, body.tools)
@@ -447,6 +504,10 @@ def create_app(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
                 )
+                # Report to expert tracker (detect silent downgrade)
+                had_reasoning = bool(message.get("reasoning_content"))
+                if use_deep_think >= 1:
+                    _expert_tracker.report_response(had_reasoning)
                 # Check if response contains tool calls
                 content = message.get("content", "")
                 parsed_tools = parse_tool_calls_xml(content) if content else None
@@ -838,6 +899,7 @@ def create_app(
         """
         thinking_count = 0
         in_thinking = False
+        had_reasoning_content = False  # Track if any reasoning was emitted
         # Track last emitted result count per block_id for incremental updates
         search_last_count: dict = {}
         result_conversation_id: Optional[str] = None
@@ -979,6 +1041,7 @@ def create_app(
                     # Normal (non-tool) path
                     if in_thinking:
                         delta = {"reasoning_content": t}
+                        had_reasoning_content = True
                     else:
                         delta = {"role": "assistant", "content": t}
                     chunk = _make_chunk(delta)
@@ -1070,6 +1133,7 @@ def create_app(
                                 continue
                             if in_thinking:
                                 delta = {"reasoning_content": t}
+                                had_reasoning_content = True
                             else:
                                 delta = {"role": "assistant", "content": t}
                             chunk = _make_chunk(delta)
@@ -1089,6 +1153,7 @@ def create_app(
                                     if t:
                                         if in_thinking:
                                             delta = {"reasoning_content": t}
+                                            had_reasoning_content = True
                                         else:
                                             delta = {"role": "assistant", "content": t}
                                         chunk = _make_chunk(delta)
@@ -1132,6 +1197,9 @@ def create_app(
 
         # Final chunk
         client.record_success()
+        # Report to expert tracker for degradation detection
+        if has_tools and use_deep_think >= 1:
+            _expert_tracker.report_response(had_reasoning_content)
         final_delta: dict = {}
         if result_conversation_id:
             final_delta["conversation_id"] = result_conversation_id
