@@ -29,6 +29,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .browser_client import BrowserClient
+from .tool_calling import (
+    build_tool_system_prompt,
+    convert_messages_with_tools,
+    parse_tool_calls_xml,
+    is_tool_call_start,
+    has_complete_tool_calls,
+)
 
 log = logging.getLogger("doubao_unified")
 
@@ -104,6 +111,9 @@ class _TokenBucket:
 class _Message(BaseModel):
     role: str
     content: Any  # str | list[dict]
+    tool_calls: Optional[list] = None  # for assistant messages with tool calls
+    tool_call_id: Optional[str] = None  # for role:tool messages
+    name: Optional[str] = None  # tool name for role:tool messages
 
 
 class ChatCompletionRequest(BaseModel):
@@ -114,6 +124,8 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     conversation_id: Optional[str] = None
     bot_id: Optional[str] = None
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[Any] = None  # "auto" | "none" | {"type":"function","function":{"name":"..."}}
 
 
 
@@ -386,38 +398,68 @@ def create_app(
     async def chat_completions(body: ChatCompletionRequest, request: Request):
         _check_auth(request)
 
-        use_deep_think = CHAT_MODELS.get(body.model)
-        if use_deep_think is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown model '{body.model}'. Available: {', '.join(CHAT_MODELS)}",
-            )
+        # ── Tool calling mode ──
+        has_tools = bool(body.tools)
+        if has_tools:
+            # Force expert model for tool calling
+            use_deep_think = CHAT_MODELS["doubao-expert"]
+            model_name = "doubao-expert"
+            # Convert messages with tool definitions injected
+            messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
+            prompt = convert_messages_with_tools(messages_raw, body.tools)
+        else:
+            use_deep_think = CHAT_MODELS.get(body.model)
+            if use_deep_think is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown model '{body.model}'. Available: {', '.join(CHAT_MODELS)}",
+                )
+            model_name = body.model
+            prompt, file_refs = _extract_prompt_and_file_refs(body.messages)
+            if not prompt:
+                raise HTTPException(status_code=400, detail="No text content")
 
         await bucket.acquire()
         client = _get_client()
-
-        prompt, file_refs = _extract_prompt_and_file_refs(body.messages)
-        if not prompt:
-            raise HTTPException(status_code=400, detail="No text content")
-
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
         if body.stream:
-            if file_refs:
-                raise HTTPException(
-                    status_code=400,
-                    detail="file_url attachments are currently supported for non-streaming requests only",
-                )
+            if not has_tools:
+                _, file_refs_check = _extract_prompt_and_file_refs(body.messages)
+                if file_refs_check:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="file_url attachments are currently supported for non-streaming requests only",
+                    )
             return StreamingResponse(
-                _stream_chat(client, prompt, use_deep_think, request_id, body.model,
-                             conversation_id=body.conversation_id, bot_id=body.bot_id),
+                _stream_chat(client, prompt, use_deep_think, request_id, model_name,
+                             conversation_id=body.conversation_id, bot_id=body.bot_id,
+                             has_tools=has_tools),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
         # Non-streaming: collect all chunks with thinking state machine
         try:
-            if file_refs:
+            if has_tools:
+                # Tool calling non-streaming path
+                message = await _collect_chat_response(
+                    client, prompt, use_deep_think,
+                    conversation_id=body.conversation_id, bot_id=body.bot_id,
+                )
+                # Check if response contains tool calls
+                content = message.get("content", "")
+                parsed_tools = parse_tool_calls_xml(content) if content else None
+                if parsed_tools:
+                    message = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": parsed_tools,
+                    }
+                    finish_reason = "tool_calls"
+                else:
+                    finish_reason = "stop"
+            elif file_refs:
                 files = await _materialize_file_refs(client, file_refs)
                 result = await client.chat_with_file(
                     text=prompt,
@@ -426,13 +468,14 @@ def create_app(
                     file_size=files[0]["size"],
                     use_deep_think=use_deep_think,
                 )
-                # chat_with_file doesn't support thinking separation yet
                 message = {"role": "assistant", "content": result["text"]}
+                finish_reason = "stop"
             else:
                 message = await _collect_chat_response(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
                 )
+                finish_reason = "stop"
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
@@ -440,11 +483,11 @@ def create_app(
             "id": request_id,
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": body.model,
+            "model": model_name,
             "choices": [{
                 "index": 0,
                 "message": message,
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
@@ -782,6 +825,7 @@ def create_app(
         *,
         conversation_id: Optional[str] = None,
         bot_id: Optional[str] = None,
+        has_tools: bool = False,
     ):
         """Generate real-time SSE stream in OpenAI format via httpx streaming.
 
@@ -797,6 +841,9 @@ def create_app(
         # Track last emitted result count per block_id for incremental updates
         search_last_count: dict = {}
         result_conversation_id: Optional[str] = None
+        # Tool calling state
+        tool_buffer = ""  # accumulates text when tool call detected
+        tool_mode = False  # True when we're buffering potential tool call XML
 
         def _make_chunk(delta: dict, finish_reason=None):
             return {
@@ -862,6 +909,65 @@ def create_app(
                     and event["text"]
                 ):
                     t = event["text"]
+                    # Tool calling: buffer text to detect XML tool_calls
+                    if has_tools and not in_thinking:
+                        tool_buffer += t
+                        if not tool_mode and is_tool_call_start(tool_buffer):
+                            tool_mode = True
+                        if tool_mode:
+                            # Check if we have complete tool calls
+                            if has_complete_tool_calls(tool_buffer):
+                                # Parse and emit as tool_calls
+                                parsed = parse_tool_calls_xml(tool_buffer)
+                                if parsed:
+                                    # Emit tool_calls in OpenAI streaming format
+                                    for idx, tc in enumerate(parsed):
+                                        # First chunk: role + tool_call with function name
+                                        delta_tc = {
+                                            "role": "assistant",
+                                            "content": None,
+                                            "tool_calls": [{
+                                                "index": idx,
+                                                "id": tc["id"],
+                                                "type": "function",
+                                                "function": {
+                                                    "name": tc["function"]["name"],
+                                                    "arguments": "",
+                                                },
+                                            }],
+                                        }
+                                        chunk = _make_chunk(delta_tc)
+                                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                        # Second chunk: arguments content
+                                        delta_args = {
+                                            "tool_calls": [{
+                                                "index": idx,
+                                                "function": {
+                                                    "arguments": tc["function"]["arguments"],
+                                                },
+                                            }],
+                                        }
+                                        chunk = _make_chunk(delta_args)
+                                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                    tool_buffer = ""
+                                    tool_mode = False
+                                # else: keep buffering
+                            continue  # don't emit raw text while in tool mode
+                        else:
+                            # Not a tool call start — flush buffer as normal content
+                            if len(tool_buffer) > 20 and not is_tool_call_start(tool_buffer):
+                                delta = {"role": "assistant", "content": tool_buffer}
+                                chunk = _make_chunk(delta)
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                tool_buffer = ""
+                            elif not tool_buffer.strip().startswith("<"):
+                                # Definitely not XML, flush immediately
+                                delta = {"role": "assistant", "content": tool_buffer}
+                                chunk = _make_chunk(delta)
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                tool_buffer = ""
+                            continue
+                    # Normal (non-tool) path
                     if in_thinking:
                         delta = {"reasoning_content": t}
                     else:
@@ -916,6 +1022,35 @@ def create_app(
                         tb = block_content.get("text_block", {})
                         if isinstance(tb, dict) and tb.get("text"):
                             t = tb["text"]
+                            # Tool calling: buffer text for XML detection
+                            if has_tools and not in_thinking:
+                                tool_buffer += t
+                                if not tool_mode and is_tool_call_start(tool_buffer):
+                                    tool_mode = True
+                                if tool_mode:
+                                    if has_complete_tool_calls(tool_buffer):
+                                        parsed = parse_tool_calls_xml(tool_buffer)
+                                        if parsed:
+                                            for idx, tc in enumerate(parsed):
+                                                delta_tc = {
+                                                    "role": "assistant", "content": None,
+                                                    "tool_calls": [{"index": idx, "id": tc["id"], "type": "function",
+                                                        "function": {"name": tc["function"]["name"], "arguments": ""}}],
+                                                }
+                                                chunk = _make_chunk(delta_tc)
+                                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                                delta_args = {"tool_calls": [{"index": idx,
+                                                    "function": {"arguments": tc["function"]["arguments"]}}]}
+                                                chunk = _make_chunk(delta_args)
+                                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                            tool_buffer = ""
+                                            tool_mode = False
+                                elif len(tool_buffer) > 20 and not is_tool_call_start(tool_buffer):
+                                    delta = {"role": "assistant", "content": tool_buffer}
+                                    chunk = _make_chunk(delta)
+                                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                    tool_buffer = ""
+                                continue
                             if in_thinking:
                                 delta = {"reasoning_content": t}
                             else:
@@ -948,6 +1083,29 @@ def create_app(
             log.error("Stream error: %s", exc)
             chunk = _make_chunk({"content": f"[Error: {exc}]"})
             yield f"data: {json.dumps(chunk)}\n\n"
+
+        # Flush any remaining tool buffer
+        if tool_buffer:
+            if tool_mode and has_complete_tool_calls(tool_buffer):
+                parsed = parse_tool_calls_xml(tool_buffer)
+                if parsed:
+                    for idx, tc in enumerate(parsed):
+                        delta_tc = {
+                            "role": "assistant", "content": None,
+                            "tool_calls": [{"index": idx, "id": tc["id"], "type": "function",
+                                "function": {"name": tc["function"]["name"], "arguments": ""}}],
+                        }
+                        chunk = _make_chunk(delta_tc)
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        delta_args = {"tool_calls": [{"index": idx,
+                            "function": {"arguments": tc["function"]["arguments"]}}]}
+                        chunk = _make_chunk(delta_args)
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            elif tool_buffer.strip():
+                # Emit as regular content
+                delta = {"role": "assistant", "content": tool_buffer}
+                chunk = _make_chunk(delta)
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
         # Final chunk
         client.record_success()
