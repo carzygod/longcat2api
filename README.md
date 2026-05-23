@@ -12,6 +12,17 @@
 
 起初只是想给自己的 Hermes Agent（基于 DeepSeek V4 Flash）补上识图能力，结果越写越多，索性做成了完整的逆向客户端和 API 服务。
 
+## 目录
+
+- [这个项目能做什么](#这个项目能做什么)
+- [原理](#原理)
+- [快速开始](#快速开始)
+- [统一 API 服务（OpenAI 兼容）](#统一-api-服务openai-兼容)
+- [Bot ID](#bot-id)
+- [底层模型与路由](#底层模型与路由)
+- [技术细节](#技术细节)
+- [项目结构](#项目结构)
+
 ## 这个项目能做什么
 
 本项目适合为通用 AI 智能体（如 OpenClaw、Hermes 等对话/任务型 Agent）补全多模态能力。
@@ -893,14 +904,15 @@ Run up fly up
 #### 安装依赖
 
 ```bash
-pip install aiohttp fastapi pydantic uvicorn
+pip install aiohttp fastapi pydantic uvicorn httpx playwright playwright-stealth python-multipart
+playwright install chromium
 ```
 
 #### 本地开发启动
 
 ```bash
-python -m doubao2api.unified_server
-# 默认监听 127.0.0.1:9090，无认证
+python -m doubao2api
+# 默认监听 0.0.0.0:9090，无认证
 ```
 
 #### 生产部署（Ubuntu）
@@ -909,10 +921,9 @@ python -m doubao2api.unified_server
 DOUBAO_API_KEY=your-secret-key \
 DOUBAO_HOST=0.0.0.0 \
 DOUBAO_PORT=9090 \
-DOUBAO_SESSION_FILE=/opt/doubao/.doubao_session.json \
 DOUBAO_RPM_LIMIT=30 \
-DOUBAO_KEEPALIVE_INTERVAL=7200 \
-python -m doubao2api.unified_server
+DOUBAO_BROWSER_DATA=/opt/doubao2api/.browser_data \
+python -m doubao2api
 ```
 
 #### systemd 服务（推荐）
@@ -930,8 +941,8 @@ WorkingDirectory=/opt/doubao
 Environment=DOUBAO_API_KEY=your-secret-key
 Environment=DOUBAO_HOST=0.0.0.0
 Environment=DOUBAO_PORT=9090
-Environment=DOUBAO_SESSION_FILE=/opt/doubao/.doubao_session.json
-ExecStart=/usr/bin/python3 -m doubao2api.unified_server
+Environment=DOUBAO_BROWSER_DATA=/opt/doubao2api/.browser_data
+ExecStart=/usr/bin/python3 -m doubao2api
 Restart=always
 RestartSec=5
 
@@ -968,16 +979,17 @@ server {
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DOUBAO_PORT` | `9090` | 监听端口 |
-| `DOUBAO_HOST` | `127.0.0.1` | 监听地址（生产环境设为 `0.0.0.0`） |
+| `DOUBAO_HOST` | `0.0.0.0` | 监听地址 |
 | `DOUBAO_API_KEY` | (空=无认证) | Bearer token。设为 `any` 接受任意非空 key |
-| `DOUBAO_RPM_LIMIT` | `50` | 每分钟请求限制（所有端点共享） |
-| `DOUBAO_TIMEOUT` | `180` | 上游请求超时秒数 |
-| `DOUBAO_SESSION_FILE` | `.doubao_session.json` | Cookie 持久化文件路径 |
-| `DOUBAO_KEEPALIVE_INTERVAL` | `7200` | 会话保活间隔（秒），`0` 禁用 |
+| `DOUBAO_RPM_LIMIT` | `20` | 每分钟请求限制（所有端点共享） |
+| `DOUBAO_HEADLESS` | `true` | Chromium 是否无头运行 |
+| `DOUBAO_BROWSER_DATA` | `~/.doubao_browser` | Chromium 持久化用户目录 |
+| `DOUBAO_NOVNC_URL` | 自动推断 | Admin 面板中的 noVNC 地址 |
+| `DOUBAO_NOVNC_PASSWORD` | 空 | 自动拼接到 noVNC URL 的密码参数 |
 
 ### 认证
 
-所有 API 端点（除 `GET /health` 和 `GET /admin`）需要 Bearer token：
+设置 `DOUBAO_API_KEY` 后，API 和 Admin 端点需要 Bearer token；不设置时不启用认证：
 
 ```
 Authorization: Bearer your-api-key
@@ -989,11 +1001,11 @@ Authorization: Bearer your-api-key
 
 ### 会话管理
 
-**启动行为**：如果 session 文件存在，服务启动时自动加载并初始化 client。
+**启动行为**：服务启动时打开持久化 Chromium 用户目录（`DOUBAO_BROWSER_DATA`），如果浏览器目录内已有登录态会自动复用。
 
-**自动保活**：后台每 2 小时访问 `doubao.com/chat` 页面触发 `Set-Cookie` 刷新，失败时指数退避重试（30s→60s→120s→300s）。
+**浏览器 watchdog**：后台每 30 秒检查浏览器是否响应，如果 Chromium 进程异常会自动重启。
 
-**对话自动清理**：每次 API 调用完成后自动删除豆包侧边栏中产生的对话记录。
+**风控处理**：如果接口返回 `710022004`，服务会在 `/health` 中标记 `needs_captcha=true`，此时需要通过 noVNC 或重新登录处理风控，再调用 `/auth/reset_captcha` 恢复服务。
 
 **首次部署 Session 获取**：
 
@@ -1010,11 +1022,7 @@ curl -X POST http://localhost:9090/v1/session/qr-login \
 curl http://localhost:9090/v1/session/qr-login \
   -H "Authorization: Bearer YOUR_KEY"
 
-# 方式 3：手动粘贴 Cookie
-curl -X POST http://localhost:9090/v1/session/update \
-  -H "Authorization: Bearer YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"cookie_header": "sessionid=xxx; ttwid=yyy; passport_csrf_token=zzz"}'
+# 如遇验证码/风控，可打开 Admin 登录页里的 noVNC 手动处理
 ```
 
 ### Admin Dashboard
@@ -1026,12 +1034,12 @@ curl -X POST http://localhost:9090/v1/session/update \
 | 页面 | 功能 |
 |------|------|
 | **概览** | Session 状态、系统配置、Cookie 详情表格、测活按钮 |
-| **登录** | QR 扫码登录，成功后 3 秒自动跳转概览页 |
+| **登录** | QR 扫码登录、noVNC 手动登录、浏览器截图 |
 | **API 测试** | 选择模型发送请求，支持流式/非流式，思维链折叠展示 |
 | **请求日志** | 最近 100 条请求记录（5s 自动刷新） |
 
-- HTML 页面本身不需要认证，数据 API 需要 Bearer token
-- 概览页每 10 秒自动刷新 session 状态（仅检查 Cookie 存在性）
+- 如果设置了 `DOUBAO_API_KEY`，HTML 页面和数据 API 都需要认证
+- 概览页每 10 秒自动刷新 session 状态
 - "测活"按钮主动发消息验证 session 有效性
 
 ### 模型列表
@@ -1039,11 +1047,9 @@ curl -X POST http://localhost:9090/v1/session/update \
 | 模型 ID | 类型 | need_deep_think | 说明 |
 |---------|------|-----------------|------|
 | `doubao` | chat | 0 | 快速模式（默认） |
-| `doubao-quick` | chat | 0 | 快速模式别名 |
 | `doubao-think` | chat | 1 | 思考模式（带思维链） |
-| `doubao-auto` | chat | 2 | 自动模式 |
 | `doubao-expert` | chat | 3 | 专家模式（深度推理） |
-| `doubao-pro` | chat | 3 | 专家模式别名 |
+| `doubao-pro` | chat | 0 | 快速模式别名 |
 | `doubao-image` | image | — | 图片生成 |
 | `doubao-video` | video | — | 视频生成 |
 | `doubao-music` | audio | — | 音乐生成 |
@@ -1056,7 +1062,13 @@ curl -X POST http://localhost:9090/v1/session/update \
 
 **响应**：
 ```json
-{"status": "ok", "service": "doubao-unified-api"}
+{
+  "status": "ok",
+  "logged_in": true,
+  "consecutive_failures": 0,
+  "needs_captcha": false,
+  "last_error_code": 0
+}
 ```
 
 #### GET /v1/models
@@ -1090,21 +1102,7 @@ OpenAI 兼容的聊天补全端点。
 }
 ```
 
-**多模态（图片输入）**：
-```json
-{
-  "model": "doubao",
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {"type": "text", "text": "描述这张图片"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
-      ]
-    }
-  ]
-}
-```
+**文件输入**：当前统一服务支持 OpenAI 风格的 `file_url`，仅支持非流式请求。图片输入的 `image_url` 结构暂未在统一服务中解析。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -1152,7 +1150,7 @@ data: [DONE]
 |-----------|------|
 | 400 | 无效模型或空消息 |
 | 401 | 认证失败 |
-| 429 | 速率限制 |
+| 503 | 未登录、浏览器未初始化或需要验证码 |
 | 502 | 上游错误（豆包 API 异常） |
 
 ---
@@ -1185,7 +1183,7 @@ curl http://localhost:9090/v1/files \
 **响应**：
 ```json
 {
-  "id": "file-a54b60e268f54d1f87210c95",
+  "id": "tos-cn-i-ik7evvg4ik/3d1fe926a54849ebaa8f69943889393a.pdf",
   "object": "file",
   "filename": "document.pdf",
   "bytes": 102400,
@@ -1197,7 +1195,7 @@ curl http://localhost:9090/v1/files \
 
 | 响应字段 | 类型 | 说明 |
 |----------|------|------|
-| `id` | string | 文件唯一标识（格式：`file-{hex24}`） |
+| `id` | string | 与 `uri` 相同，兼容 OpenAI 文件对象格式 |
 | `object` | string | 固定 `"file"` |
 | `filename` | string | 原始文件名 |
 | `bytes` | int | 文件大小（字节） |
@@ -1450,7 +1448,7 @@ curl http://localhost:9090/v1/chat/completions \
   "prompt": "一只猫在月球上",
   "model": "doubao-image",
   "ratio": "16:9",
-  "ref_image_url": "https://example.com/ref.png"
+  "size": "1792x1024"
 }
 ```
 
@@ -1458,8 +1456,8 @@ curl http://localhost:9090/v1/chat/completions \
 |------|------|------|------|
 | `prompt` | string | 是 | 图片描述 |
 | `model` | string | 否 | 固定 `doubao-image` |
-| `ratio` | string | 否 | 宽高比：`1:1`/`16:9`/`9:16`/`4:3`/`3:4` |
-| `ref_image_url` | string | 否 | 参考图 URL 或 `data:image/png;base64,...`（图生图） |
+| `ratio` | string | 否 | 豆包比例：`1:1`/`16:9`/`9:16`/`4:3`/`3:4`；优先级高于 `size` |
+| `size` | string | 否 | OpenAI 风格尺寸：`1024x1024`/`1792x1024`/`1024x1792`/`1024x768`/`768x1024`；也可直接传 `1:1`/`16:9`/`9:16`/`4:3`/`3:4` |
 
 **响应**：
 ```json
@@ -1468,9 +1466,7 @@ curl http://localhost:9090/v1/chat/completions \
   "data": [
     {
       "url": "https://p-vcloud.byteimg.com/...",
-      "width": 1920,
-      "height": 1080,
-      "raw_url": "https://..."
+      "revised_prompt": "一只猫在月球上"
     }
   ]
 }
@@ -1478,17 +1474,16 @@ curl http://localhost:9090/v1/chat/completions \
 
 ---
 
-#### POST /v1/videos/generations
+#### POST /v1/video/generations
 
-视频生成端点（异步）。
+视频生成端点。当前接口会在请求内等待任务结果，成功后直接返回视频列表。
 
 **请求体**：
 ```json
 {
+  "model": "doubao-video",
   "prompt": "一只柴犬在雪地奔跑",
-  "ratio": "16:9",
-  "camera_movement": "zoom_in",
-  "stream": false
+  "ratio": "16:9"
 }
 ```
 
@@ -1496,38 +1491,16 @@ curl http://localhost:9090/v1/chat/completions \
 |------|------|------|------|
 | `prompt` | string | 是 | 视频描述 |
 | `model` | string | 否 | 固定 `doubao-video` |
-| `ratio` | string | 否 | `1:1`/`16:9`/`9:16` |
-| `camera_movement` | string | 否 | 镜头运动方式 |
-| `ref_image_url` | string | 否 | 参考图（图生视频） |
-| `stream` | bool | 否 | `true`=SSE 长连接等待结果，`false`=返回 task_id 轮询 |
+| `ratio` | string | 否 | `1:1`/`16:9`/`9:16`，也可传 OpenAI 风格 `size` 后自动映射 |
 
-**非流式响应**（`stream=false`，HTTP 202）：
+**响应**：
 ```json
-{"id": "vtask-abc123", "status": "processing", "created": 1700000000}
-```
-
-**轮询**：`GET /v1/videos/{task_id}`
-
-```json
-// 处理中
-{"id": "vtask-abc123", "status": "processing"}
-
-// 完成
 {
-  "id": "vtask-abc123",
-  "status": "completed",
-  "data": [{"url": "https://...", "cover_url": "https://...", "duration": 5.0, "width": 1920, "height": 1080}]
+  "created": 1700000000,
+  "data": [
+    {"video_url": "https://...", "cover_url": "https://...", "duration": 5.0, "width": 1920, "height": 1080}
+  ]
 }
-
-// 失败
-{"id": "vtask-abc123", "status": "failed", "error": "服务过载"}
-```
-
-**流式响应**（`stream=true`，SSE）：
-```
-data: {"status":"completed","created":1700000000,"data":[{"url":"https://...","cover_url":"...","duration":5.0}]}
-
-data: [DONE]
 ```
 
 ---
@@ -1539,11 +1512,10 @@ data: [DONE]
 **请求体**：
 ```json
 {
+  "model": "doubao-music",
   "prompt": "一首关于夏天的轻快流行歌",
   "genre": "Pop",
-  "mood": "Happy",
-  "gender": "Female",
-  "generation_type": "AI_lyric"
+  "lyric": "可选歌词"
 }
 ```
 
@@ -1551,12 +1523,8 @@ data: [DONE]
 |------|------|------|------|
 | `prompt` | string | 是 | 歌曲描述 |
 | `model` | string | 否 | 固定 `doubao-music` |
-| `lyric` | string | 否 | 自定义歌词（需配合 `generation_type: "custome_lyric"`） |
-| `genre` | string | 否 | 流派（见上方参数有效值） |
-| `mood` | string | 否 | 情绪 |
-| `gender` | string | 否 | 声线：`Male`/`Female` |
-| `theme` | string | 否 | 主题标签 |
-| `generation_type` | string | 否 | `AI_lyric`/`custome_lyric`，默认 AI 写词 |
+| `lyric` | string | 否 | 自定义歌词 |
+| `genre` | string | 否 | 流派 |
 
 **响应**：
 ```json
@@ -1564,7 +1532,7 @@ data: [DONE]
   "created": 1700000000,
   "data": [
     {
-      "url": "https://v3-web.douyinvod.com/...",
+      "audio_url": "https://v3-web.douyinvod.com/...",
       "title": "夏日微风",
       "duration": 95.5,
       "lyrics": "完整歌词...",
@@ -1576,47 +1544,23 @@ data: [DONE]
 
 ---
 
-#### GET /v1/session/status
+#### GET /auth/status
 
 查看当前 session 健康状态。
-
-| 查询参数 | 说明 |
-|----------|------|
-| `probe=true` | 发送真实消息测试 session（慢，默认不启用） |
 
 **响应**：
 ```json
 {
-  "status": "healthy",
-  "age_seconds": 3600,
-  "cookies_present": ["sessionid", "ttwid", "passport_csrf_token"],
-  "has_sessionid": true,
-  "has_csrf_token": true,
-  "has_sid_guard": true
+  "logged_in": true,
+  "is_ready_flag": true,
+  "login_button_visible": false,
+  "page_url": "https://www.doubao.com/chat/",
+  "device_id": "...",
+  "web_id": "..."
 }
 ```
 
-`status` 可能的值：`healthy` / `degraded` / `no_session` / `expired` / `no_client`
-
----
-
-#### POST /v1/session/update
-
-手动更新 session cookie。
-
-**请求体**（二选一）：
-```json
-// 方式 1：Cookie 字典
-{"cookies": {"sessionid": "xxx", "ttwid": "yyy", "passport_csrf_token": "zzz"}}
-
-// 方式 2：Cookie 头字符串
-{"cookie_header": "sessionid=xxx; ttwid=yyy; passport_csrf_token=zzz"}
-```
-
-**响应**：
-```json
-{"status": "ok", "message": "Session updated with 5 cookies", "cookies_received": ["sessionid", "ttwid", ...]}
-```
+`/admin/api/status` 返回同样结构。
 
 ---
 
@@ -1751,33 +1695,26 @@ curl http://localhost:9090/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{"prompt":"一只猫在月球上","ratio":"16:9"}'
 
-# 视频生成（异步）
-curl http://localhost:9090/v1/videos/generations \
+# 视频生成（请求内等待结果）
+curl http://localhost:9090/v1/video/generations \
   -H "Authorization: Bearer sk-xxx" \
   -H "Content-Type: application/json" \
   -d '{"prompt":"一只柴犬在雪地奔跑","ratio":"16:9"}'
-# → {"id":"vtask-xxx","status":"processing"}
-
-# 轮询视频状态
-curl http://localhost:9090/v1/videos/vtask-xxx \
-  -H "Authorization: Bearer sk-xxx"
 
 # 音乐生成
 curl http://localhost:9090/v1/audio/generations \
   -H "Authorization: Bearer sk-xxx" \
   -H "Content-Type: application/json" \
-  -d '{"prompt":"一首轻快的夏日歌曲","genre":"Pop","mood":"Happy"}'
+  -d '{"prompt":"一首轻快的夏日歌曲","genre":"Pop"}'
 ```
 
 ## Bot ID
 
 | Bot ID | 说明 | 多模态 | 备注 |
 |--------|------|--------|------|
-| `7234781073513644036` | 默认豆包 AI (`DEFAULT_BOT_ID`) | 不支持 | 纯文本对话 |
-| `7338286299411103781` | 扩展版 Bot (`EXTENSION_BOT_ID`) | **支持** | 图片+文本，推荐 |
+| `7338286299411103781` | 当前统一服务默认 Bot | 文件问答/多媒体生成 | `BrowserClient.DEFAULT_BOT_ID` |
 
-> **重要**: `EXTENSION_BOT_ID` 支持图片输入（多模态），`DEFAULT_BOT_ID` 不支持。
-> 统一 API 服务默认使用 `EXTENSION_BOT_ID`。
+> 说明：`client.py` 中仍保留旧版 `DoubaoChatClient` 的 Bot ID 常量；当前统一服务主路径使用 `BrowserClient`，默认 Bot ID 为 `7338286299411103781`。
 
 ## 底层模型与路由
 
@@ -1803,7 +1740,6 @@ curl http://localhost:9090/v1/audio/generations \
 |-----------------|------|-------------------|--------|
 | 0 | 快速 | `use_deep_think: false` | 无 |
 | 1 | 思考 | `use_deep_think: true` | 有（10040+10000） |
-| 2 | 自动 | `use_auto_cot: true` | 视内容 |
 | 3 | 专家 | `use_deep_think: true, use_auto_cot: true` | 有（10040+10000） |
 
 ### API 响应中的模型元数据
@@ -1834,19 +1770,34 @@ SSE 事件的 `message.ext` 字段包含：
 
 ### 认证流程
 
-通过 QR 扫码登录获取完整 session：
+通过 QR 扫码登录获取完整 session，并注入到 Playwright 持久化浏览器上下文：
 
 1. 请求 CSRF token（`GET https://www.doubao.com`）
 2. 获取 QR 码（`POST /passport/web/scan_qrcode/`）
 3. 用户用豆包 App 扫码确认
-4. 获取 `sessionid`、`ttwid`、`passport_csrf_token`、`msToken` 等 Cookie
-5. 持久化到 `.doubao_session.json`
+4. 获取 `sessionid`、`ttwid`、`passport_csrf_token` 等 Cookie
+5. 注入 Chromium 用户目录，后续启动复用 `DOUBAO_BROWSER_DATA`
 
 ### 请求格式
 
-#### `/samantha/chat/completion`（主端点）
+#### `/chat/completion`（聊天主端点）
 
-请求体为 JSON 明文的 `sentEvent` 对象：
+当前统一服务的文本聊天、文件问答使用 `/chat/completion`，由 Playwright 页面内的 `bdms.frontierSign` 对 query string 进行签名，然后用 httpx 发起真实 SSE 请求。
+
+关键点：
+
+| 项目 | 值 |
+|------|-----|
+| URL | `/chat/completion?aid=497858&device_platform=web&...&X-Bogus=...` |
+| Method | POST |
+| Content-Type | `application/json` |
+| 签名 | `window.bdms.frontierSign(query_string)` |
+| CSRF | 从 `passport_csrf_token` Cookie 自动提取 |
+| msToken | 启动时从 Cookie 读取，请求后从 `x-ms-token` 响应头轮换 |
+
+#### `/samantha/chat/completion`（图片/视频/音乐生成端点）
+
+图片、视频、音乐生成使用 `/samantha/chat/completion`。请求体为 JSON 明文对象：
 
 ```json
 {
@@ -1890,15 +1841,6 @@ SSE 事件的 `message.ext` 字段包含：
 | `completion_option.launch_stage` | int | `1` = Release |
 | `completion_option.memory_type` | int | `2` = ToolMemory |
 
-HTTP 配置：
-
-| 项目 | 值 |
-|------|-----|
-| URL | `/samantha/chat/completion?aid=582478&device_platform=web&language=zh` |
-| Method | POST |
-| Content-Type | `application/json` |
-| 额外 Header | `Agw-Js-Conv: str` |
-
 ### SSE 事件类型
 
 | event_type | 枚举名 | 说明 |
@@ -1929,7 +1871,7 @@ HTTP 配置：
 
 ### 思考链提取
 
-仅 `/samantha/chat/completion` 端点可提取完整思考链：
+聊天流中通过 `block_type=10040` 切换思考状态，`block_type=10000` 或 `CHUNK_DELTA` 承载文本：
 
 ```
 SSE event_type=2001 (CMPL)
@@ -1943,40 +1885,21 @@ SSE event_type=2002 (ACK) → conversation_id
 SSE event_type=2003 (FIN) → 流结束
 ```
 
-### 对话删除 API
-
-每次 API 调用后自动删除对话：
-
-- 端点：`POST https://www.doubao.com/samantha/thread/delete`
-- Body：`{"thread_id": "<conversation_id_as_string>"}`
-- 响应：`{"code": 0, "msg": ""}` (成功)
-- `thread_id` 必须是字符串，整数会报 710010202
-
-### Session 过期检测
+### Session 过期与风控检测
 
 | 端点 | 过期信号 |
 |------|----------|
-| `/samantha/chat/completion` | SSE `gateway-error` with `710012000` |
-| `/chat/completion` | JSON `{"code": 710012001}` |
+| `/chat/completion` | SSE `error_code` / `STREAM_ERROR` |
+| `/samantha/chat/completion` | JSON 错误或 SSE `event_type=2005` |
+| 风控验证码 | `710022004` |
 
-Cookie 刷新方式：`GET https://www.doubao.com/chat`（页面加载触发 `Set-Cookie`）
+触发 `710022004` 后，服务会标记 `needs_captcha=true`，`/health` 会暴露该状态，`_get_client()` 会拒绝继续请求，直到人工完成验证并调用 `/auth/reset_captcha`。
 
 ### msToken 与风控
 
 `msToken` 是字节跳动前端 JSSDK（BDMS/Slardar）生成的设备指纹 token，存储在 `.bytedance.com` 域下。格式为 136 字节随机数据的 base64url 编码（184 字符）。
 
-**服务端校验逻辑**：
-
-| msToken 状态 | 服务端行为 |
-|-------------|-----------|
-| 不传（参数中不包含） | ✅ 跳过校验，正常响应 |
-| 空字符串 `""` | ✅ 跳过校验，正常响应 |
-| 随机伪造（格式正确但内容无效） | ❌ 触发风控 710022002 频率限制 |
-| 真实有效值 | ✅ 校验通过 |
-
-**本项目策略**：不传 msToken。QR 扫码登录无法获取 msToken（它由前端 JS 运行时生成，不参与认证流程），且服务端对"无 msToken"的容忍度远高于"假 msToken"。不传比乱传安全。
-
-> 如果未来字节跳动加强校验（强制要求 msToken），需要通过逆向 BDMS SDK 生成有效 token，或从浏览器环境中获取。
+**本项目策略**：启动时尝试从浏览器 Cookie 中读取 `msToken`；如果为空则不传；请求成功后如果响应头包含 `x-ms-token`，自动更新并用于后续请求。不要传空字符串或伪造值。
 
 ### 搜索工具调用捕获
 
@@ -2002,29 +1925,25 @@ Cookie 刷新方式：`GET https://www.doubao.com/chat`（页面加载触发 `Se
 
 **API 响应中的搜索结果**：
 
-非流式响应在顶层增加 `search_results` 字段：
+流式响应通过 `delta.search_results` 传递：
 
 ```json
 {
-  "id": "chatcmpl-...",
-  "choices": [...],
-  "search_results": {
-    "type": "search",
-    "summary": "搜索 3 个关键词，参考 23 篇资料",
-    "queries": ["关键词1", "关键词2"],
-    "is_finish": true,
-    "results": [
-      {"title": "...", "url": "...", "summary": "...", "source": "..."}
-    ]
-  }
+  "choices": [{
+    "delta": {
+      "search_results": {
+        "summary": "搜索 3 个关键词，参考 23 篇资料",
+        "queries": ["关键词1", "关键词2"],
+        "results": [
+          {"title": "...", "url": "...", "summary": "...", "source": "..."}
+        ]
+      }
+    }
+  }]
 }
 ```
 
-流式响应通过 `delta.search_results` 传递（仅包含有实际结果的事件）：
-
-```json
-{"choices": [{"delta": {"role": "assistant", "search_results": {...}}}]}
-```
+Admin 面板会合并多次增量搜索结果，并显示关键词、来源和摘要。
 
 **已知 block_type 列表**：
 

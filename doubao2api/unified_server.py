@@ -120,6 +120,7 @@ class ImageGenerationRequest(BaseModel):
     model: str = "doubao-image"
     n: int = 1
     size: Optional[str] = "1024x1024"
+    ratio: Optional[str] = None
     response_format: Optional[str] = "url"
 
 # ── Application factory ──────────────────────────────────────
@@ -449,7 +450,7 @@ def create_app(
         await bucket.acquire()
         client = _get_client()
 
-        ratio = _size_to_ratio(body.size)
+        ratio = body.ratio or _size_to_ratio(body.size)
 
         try:
             result = await client.generate_image(
