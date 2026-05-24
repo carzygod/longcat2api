@@ -95,6 +95,18 @@ _TOOL_CALL_RE = re.compile(
     re.DOTALL,
 )
 
+# Matches JSON object followed by </tool_call> (missing opening tag - thinking mode)
+_TOOL_CALL_PARTIAL_RE = re.compile(
+    r"(\{[^{}]*\"name\"[^{}]*\"arguments\"[^{}]*\{[^}]*\}[^{}]*\})\s*</tool_call>",
+    re.DOTALL,
+)
+
+# Even more lenient: just find JSON with "name" and "arguments" keys near </tool_call>
+_TOOL_CALL_JSON_RE = re.compile(
+    r"(\{[^{}]*\"name\"\s*:\s*[^,}]+[^{}]*\"arguments\"\s*:\s*\{[^}]*\}[^{}]*\})",
+    re.DOTALL,
+)
+
 # Legacy format support (for backward compat with old model outputs)
 _TOOL_CALLS_RE = re.compile(
     r"<tool_calls>\s*(.*?)\s*</tool_calls>",
@@ -108,6 +120,27 @@ _PARAM_RE = re.compile(
     r'<parameter\s+name="([^"]+)">(.*?)</parameter>',
     re.DOTALL,
 )
+
+
+def _try_parse_json(json_str: str) -> Optional[dict]:
+    """Try to parse JSON, with fallback fixes for common model output issues."""
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+    # Fix unquoted values
+    fixed = re.sub(
+        r'(?<=[{,:])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?=[,}])',
+        r' "\1"', json_str,
+    )
+    fixed = re.sub(
+        r'(?<=[{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:',
+        r' "\1":', fixed,
+    )
+    try:
+        return json.loads(fixed)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
@@ -164,7 +197,45 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
     if tool_calls:
         return tool_calls
     
-    # Fallback: legacy <tool_calls><invoke> format
+    # Fallback 2: partial format (missing opening <tool_call> tag, common in thinking mode)
+    if "</tool_call>" in text:
+        for m in _TOOL_CALL_PARTIAL_RE.finditer(text):
+            json_str = m.group(1).strip()
+            obj = _try_parse_json(json_str)
+            if obj and isinstance(obj, dict) and "name" in obj:
+                arguments = obj.get("arguments", {})
+                if isinstance(arguments, dict):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                elif not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {"name": obj["name"], "arguments": arguments},
+                })
+        if tool_calls:
+            return tool_calls
+
+    # Fallback 3: just find JSON with name+arguments pattern (no tags at all)
+    if not tool_calls:
+        for m in _TOOL_CALL_JSON_RE.finditer(text):
+            json_str = m.group(1).strip()
+            obj = _try_parse_json(json_str)
+            if obj and isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+                arguments = obj.get("arguments", {})
+                if isinstance(arguments, dict):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                elif not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {"name": obj["name"], "arguments": arguments},
+                })
+        if tool_calls:
+            return tool_calls
+
+    # Fallback 4: legacy <tool_calls><invoke> format
     match = _TOOL_CALLS_RE.search(text)
     if not match:
         return None
@@ -192,14 +263,27 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
 def is_tool_call_start(text: str) -> bool:
     """Check if accumulated text looks like the start of a tool call."""
     stripped = text.strip()
-    return (stripped.startswith("<tool_call>") or 
-            stripped.startswith("<tool_call\n") or
-            stripped.startswith("<tool_calls>"))
+    if stripped.startswith("<tool_call>") or stripped.startswith("<tool_call\n"):
+        return True
+    if stripped.startswith("<tool_calls>"):
+        return True
+    # Thinking mode: tool call may start with JSON directly (no opening tag)
+    # Check if it looks like {"name": ...} or starts with { followed by "name"
+    if stripped.startswith("{") and '"name"' in stripped[:100]:
+        return True
+    return False
 
 
 def has_complete_tool_calls(text: str) -> bool:
-    """Check if text contains at least one complete tool_call block."""
-    return "</tool_call>" in text or "</tool_calls>" in text
+    """Check if text contains at least one complete tool_call block or parseable JSON."""
+    if "</tool_call>" in text or "</tool_calls>" in text:
+        return True
+    # In thinking mode, might just be bare JSON with name+arguments
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        if '"name"' in stripped and '"arguments"' in stripped:
+            return True
+    return False
 
 
 # ── Message conversion for multi-turn tool use ──
