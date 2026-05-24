@@ -29,6 +29,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .browser_client import BrowserClient
+from .qianwen_client import QianwenClient, QIANWEN_MODELS
 from .tool_calling import (
     build_tool_system_prompt,
     convert_messages_with_tools,
@@ -49,9 +50,15 @@ CHAT_MODELS: Dict[str, int] = {
     "doubao-expert": 3,
 }
 
+# Qianwen models (routed to QianwenClient)
+QIANWEN_MODEL_NAMES = set(QIANWEN_MODELS.keys())
+
 ALL_MODELS = [
     {"id": m, "object": "model", "owned_by": "doubao", "created": 0}
     for m in CHAT_MODELS
+] + [
+    {"id": m, "object": "model", "owned_by": "qianwen", "created": 0}
+    for m in QIANWEN_MODELS
 ] + [
     {"id": "doubao-image", "object": "model", "owned_by": "doubao", "created": 0},
     {"id": "doubao-music", "object": "model", "owned_by": "doubao", "created": 0},
@@ -206,6 +213,7 @@ def create_app(
     """Build and return a configured FastAPI application."""
 
     _browser: Dict[str, Any] = {}  # holds BrowserClient instance
+    _qianwen: Dict[str, Any] = {}  # holds QianwenClient instance
 
     async def _browser_watchdog():
         """Background task: check browser health every 30s, auto-restart on crash."""
@@ -252,6 +260,23 @@ def create_app(
         # Start browser watchdog
         watchdog_task = asyncio.create_task(_browser_watchdog())
 
+        # Start Qianwen client (optional, enabled via env var)
+        qw_client = None
+        if os.environ.get("QIANWEN_ENABLED", "false").lower() == "true":
+            qw_headless = os.environ.get("QIANWEN_HEADLESS", "true").lower() == "true"
+            qw_data_dir = os.environ.get(
+                "QIANWEN_BROWSER_DATA",
+                os.path.join(os.path.expanduser("~"), ".qianwen_browser"),
+            )
+            qw_client = QianwenClient(headless=qw_headless, user_data_dir=qw_data_dir)
+            try:
+                await qw_client.start()
+                _qianwen["client"] = qw_client
+                log.info("Qianwen client ready")
+            except Exception as e:
+                log.warning("Qianwen client failed to start: %s", e)
+                qw_client = None
+
         yield
 
         # Shutdown
@@ -259,6 +284,9 @@ def create_app(
         client = _browser.pop("client", None)
         if client:
             await client.stop()
+        qw = _qianwen.pop("client", None)
+        if qw:
+            await qw.stop()
 
     app = FastAPI(title="Doubao API", version="1.0.0", lifespan=lifespan)
 
@@ -316,6 +344,17 @@ def create_app(
                 status_code=503,
                 detail="Captcha verification required (710022004). Please complete captcha via VNC or re-login.",
             )
+        return client
+
+    def _get_qianwen_client() -> QianwenClient:
+        client = _qianwen.get("client")
+        if client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Qianwen client not available. Set QIANWEN_ENABLED=true.",
+            )
+        if not client.is_ready:
+            raise HTTPException(status_code=503, detail="Qianwen client not ready")
         return client
 
     # ── Prompt extraction ──
@@ -445,6 +484,9 @@ def create_app(
             result["needs_captcha"] = client.needs_captcha
             result["last_error_code"] = client.last_error_code
         result["expert_degraded"] = _expert_tracker.is_degraded
+        # Qianwen status
+        qw = _qianwen.get("client")
+        result["qianwen_ready"] = qw.is_ready if qw else False
         return result
 
     @app.get("/v1/models")
@@ -455,6 +497,10 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatCompletionRequest, request: Request):
         _check_auth(request)
+
+        # ── Route to Qianwen if model matches ──
+        if body.model in QIANWEN_MODEL_NAMES:
+            return await _handle_qianwen_chat(body, request)
 
         # ── Tool calling mode ──
         has_tools = bool(body.tools)
@@ -468,9 +514,10 @@ def create_app(
         else:
             use_deep_think = CHAT_MODELS.get(body.model)
             if use_deep_think is None:
+                all_models = list(CHAT_MODELS.keys()) + list(QIANWEN_MODEL_NAMES)
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Unknown model '{body.model}'. Available: {', '.join(CHAT_MODELS)}",
+                    detail=f"Unknown model '{body.model}'. Available: {', '.join(all_models)}",
                 )
             model_name = body.model
             prompt, file_refs = _extract_prompt_and_file_refs(body.messages)
@@ -577,6 +624,113 @@ def create_app(
         if message.get("conversation_id"):
             resp_data["conversation_id"] = message["conversation_id"]
         return JSONResponse(resp_data)
+
+    # ------------------------------------------------------------------
+    # Qianwen chat handler
+    # ------------------------------------------------------------------
+
+    async def _handle_qianwen_chat(body: ChatCompletionRequest, request: Request):
+        """Handle chat completions routed to Qianwen."""
+        qw_client = _get_qianwen_client()
+        model_config = QIANWEN_MODELS.get(body.model, {"model": "Qwen", "deep_search": "0"})
+        qw_model = model_config["model"]
+        deep_search = model_config["deep_search"]
+        request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+        messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
+
+        if body.stream:
+            return StreamingResponse(
+                _stream_qianwen_chat(
+                    qw_client, messages_raw, qw_model, deep_search,
+                    request_id, body.model,
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        else:
+            # Non-streaming
+            try:
+                result = await qw_client.chat(messages_raw, qw_model, deep_search)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+            content = result["content"]
+            usage = result.get("usage", {})
+            return JSONResponse({
+                "id": request_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": result.get("model", body.model),
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            })
+
+    async def _stream_qianwen_chat(
+        qw_client: QianwenClient,
+        messages: list,
+        model: str,
+        deep_search: str,
+        request_id: str,
+        model_name: str,
+    ):
+        """Generate OpenAI-compatible SSE stream from Qianwen's cumulative format."""
+        prev_content = ""  # Track previous content for delta calculation
+
+        def _make_chunk(delta: dict, finish_reason=None):
+            return {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }],
+            }
+
+        # First chunk: role
+        chunk = _make_chunk({"role": "assistant", "content": ""})
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        try:
+            async for event in qw_client.chat_stream(messages, model, deep_search):
+                if event.get("error"):
+                    err_chunk = _make_chunk(
+                        {"content": f"[Error: {event.get('message', 'unknown')}]"}
+                    )
+                    yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                    break
+
+                data = event.get("data", {})
+                msgs = data.get("messages", [])
+                for msg in msgs:
+                    if msg.get("mime_type") == "multi_load/iframe" and msg.get("content"):
+                        current = msg["content"]
+                        # Compute delta (new text since last chunk)
+                        if len(current) > len(prev_content):
+                            delta_text = current[len(prev_content):]
+                            prev_content = current
+                            delta_chunk = _make_chunk({"content": delta_text})
+                            yield f"data: {json.dumps(delta_chunk, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            log.error("Qianwen stream error: %s", e)
+            err_chunk = _make_chunk({"content": f"[Stream error: {e}]"})
+            yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+
+        # Final chunk with usage (if available)
+        final_chunk = _make_chunk({}, finish_reason="stop")
+        yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
 
     @app.post("/v1/images/generations")
     async def image_generations(body: ImageGenerationRequest, request: Request):
