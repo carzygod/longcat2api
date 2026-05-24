@@ -87,9 +87,13 @@ def _compress_params(params: dict) -> str:
 PRIORITY_TOOLS = {
     "Read", "Write", "Edit", "Shell", "Bash", "Glob", "Grep",
     "WebFetch", "Task", "TodoWrite",
-    # Common OpenCode tools
+    # Common OpenCode tools (lowercase variants)
     "read", "write", "edit", "bash", "glob", "grep",
     "webfetch", "task", "todowrite",
+    # Obfuscated names (when obfuscation is enabled)
+    "fs_read_file", "fs_write_file", "fs_edit_file",
+    "exec_command", "exec_shell", "text_search", "file_find",
+    "http_fetch", "web_query",
 }
 
 
