@@ -288,10 +288,14 @@ def has_complete_tool_calls(text: str) -> bool:
 
 # ── Message conversion for multi-turn tool use ──
 
-# Max chars for the flattened prompt (~28K tokens safe zone for Qwen web)
-MAX_PROMPT_CHARS = 50000
-# Max chars per individual tool result
-MAX_TOOL_RESULT_CHARS = 8000
+# Qianwen web model token limit is ~32K tokens.
+# We use a character-based heuristic: typical code = ~3 chars/token.
+# Safe budget: 30K tokens × 3 chars = 90K chars.
+# But we must account for JSON escaping in the POST body (~1.3x for code with newlines).
+# Effective safe limit: 90K / 1.3 ≈ 70K chars.
+MAX_PROMPT_CHARS = 70000
+# Max chars per individual tool result (keep enough context per file)
+MAX_TOOL_RESULT_CHARS = 12000
 
 
 def _truncate_tool_result(content: str, max_chars: int = MAX_TOOL_RESULT_CHARS) -> str:
@@ -369,18 +373,39 @@ def convert_messages_with_tools(
 def _drop_old_rounds(parts: list[str], max_chars: int) -> str:
     """Drop oldest tool call/result pairs until under the limit.
     
-    Strategy: keep first part (system) and last few parts (recent context),
-    drop middle parts (old tool results) with a summary marker.
+    Strategy:
+    1. If system prompt is too large, truncate it
+    2. Always keep the user message and most recent tool rounds
+    3. Drop oldest tool rounds first
     """
     if not parts:
         return ""
     
-    # Always keep: first part (system+tools) and last part
-    # Drop from position 1 onwards until we fit
-    header = parts[0]  # system prompt
+    header = parts[0]  # system prompt (may be very large)
     
-    # Find how many parts we can keep from the end
-    budget = max_chars - len(header) - 200  # reserve for join separators + marker
+    # If header alone exceeds 60% of budget, truncate it
+    max_header = int(max_chars * 0.6)
+    if len(header) > max_header:
+        # Keep the tool instruction part (last ~2000 chars) and truncate the system prompt
+        # Find where tool instructions start
+        tool_marker = "当你需要调用工具时"
+        marker_pos = header.find(tool_marker)
+        if marker_pos > 0:
+            # Keep: first 2000 chars of system + all tool instructions
+            sys_prefix = header[:2000]
+            tool_instructions = header[marker_pos - 200:]  # include some context before marker
+            header = sys_prefix + "\n\n[... system prompt truncated ...]\n\n" + tool_instructions
+        else:
+            header = header[:max_header] + "\n[... truncated ...]"
+    
+    # Calculate budget for conversation history
+    budget = max_chars - len(header) - 200
+    
+    # Ensure minimum budget for at least some history
+    if budget < 5000:
+        budget = 5000  # Force at least 5K chars for recent context
+    
+    # Keep parts from the end (most recent first)
     kept_tail = []
     tail_size = 0
     
@@ -392,9 +417,15 @@ def _drop_old_rounds(parts: list[str], max_chars: int) -> str:
         else:
             break
     
+    # If we couldn't keep anything, force-keep at least the last 2 parts
+    if not kept_tail and len(parts) > 1:
+        kept_tail = parts[-2:]  # last user msg + last tool result
+        # Truncate these if needed
+        kept_tail = [p[:3000] if len(p) > 3000 else p for p in kept_tail]
+    
     dropped_count = len(parts) - 1 - len(kept_tail)
     if dropped_count > 0:
-        marker = f"[... {dropped_count} earlier messages truncated to fit context limit ...]"
+        marker = f"[... {dropped_count} earlier messages omitted ...]"
         return "\n\n".join([header, marker] + kept_tail)
     else:
         return "\n\n".join([header] + kept_tail)
