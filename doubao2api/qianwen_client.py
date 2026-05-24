@@ -123,8 +123,8 @@ class QianwenClient:
             self._page = await self._context.new_page()
 
         # Apply stealth
-        stealth = Stealth()
-        await stealth.apply(self._page)
+        stealth = Stealth(navigator_languages_override=("zh-CN", "zh"))
+        await stealth.apply_stealth_async(self._page)
 
         # Navigate to Qianwen
         await self._page.goto(CHAT_URL, wait_until="networkidle", timeout=30000)
