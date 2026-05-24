@@ -20,39 +20,88 @@ log = logging.getLogger(__name__)
 
 # ── System prompt template for tool calling ──
 
-TOOL_SYSTEM_PROMPT = """你是一个工具调用助手。你只能通过调用工具来获取外部信息或执行操作。禁止使用你的内置联网搜索能力。
+TOOL_SYSTEM_PROMPT = """你是一个工具调用助手。禁止使用内置联网搜索。
 
-可用工具列表：
-
+## 可用工具
 {tool_definitions}
 
-当你需要调用工具时，请严格使用以下格式输出：
+## 调用格式
 <tool_call>
 {{"name": "工具名", "arguments": {{"参数名": "参数值"}}}}
 </tool_call>
 
-如果需要并行调用多个工具，输出多个<tool_call>块：
-<tool_call>
-{{"name": "工具1", "arguments": {{...}}}}
-</tool_call>
-<tool_call>
-{{"name": "工具2", "arguments": {{...}}}}
-</tool_call>
+多个工具可并行调用（输出多个<tool_call>块）。
 
-重要规则：
-1. 你没有联网能力，不能直接搜索信息，必须通过上述工具获取所有外部信息
-2. 如果需要调用工具，只输出<tool_call>格式的工具调用，不要有任何解释文字
-3. 如果用户的问题不需要使用工具就能回答，直接用自然语言回答
-4. 不要编造数据，必须通过工具获取"""
+## 规则
+1. 必须使用上面列出的**精确工具名**，不要用别名或猜测的名字
+2. 参数必须严格匹配工具签名中的字段名（!为必填，?为可选）
+3. 需要调用工具时只输出<tool_call>块，不加解释文字
+4. 不需要工具时直接用自然语言回答"""
 
 TOOL_RESULT_TEMPLATE = "[工具调用结果]\n{name} 返回：{content}"
 
 
 # ── Convert OpenAI tools schema to text ──
 
+def _compress_type(pinfo: dict) -> str:
+    """Compress a JSON Schema property to TS-like type notation."""
+    ptype = pinfo.get("type", "string")
+    enum = pinfo.get("enum")
+    if enum:
+        return "|".join(json.dumps(v, ensure_ascii=False) for v in enum)
+    if ptype == "array":
+        items = pinfo.get("items", {})
+        item_type = items.get("type", "any")
+        return f"{item_type}[]"
+    if ptype == "object":
+        # Nested object - just use 'object'
+        return "object"
+    return ptype
+
+
+def _compress_params(params: dict) -> str:
+    """Compress JSON Schema parameters to TS-like signature.
+    
+    Example output: {file_path!: string, encoding?: "utf-8"|"base64"}
+    '!' = required, '?' = optional
+    """
+    props = params.get("properties", {})
+    required = set(params.get("required", []))
+    if not props:
+        return "{}"
+    
+    parts = []
+    for pname, pinfo in props.items():
+        marker = "!" if pname in required else "?"
+        ptype = _compress_type(pinfo)
+        pdesc = pinfo.get("description", "")
+        # Only include short descriptions (< 60 chars) inline
+        if pdesc and len(pdesc) < 60:
+            parts.append(f"{pname}{marker}: {ptype} /* {pdesc} */")
+        else:
+            parts.append(f"{pname}{marker}: {ptype}")
+    return "{" + ", ".join(parts) + "}"
+
+
+# Priority tools get full param expansion; others get name+desc only
+PRIORITY_TOOLS = {
+    "Read", "Write", "Edit", "Shell", "Bash", "Glob", "Grep",
+    "WebFetch", "Task", "TodoWrite",
+    # Common OpenCode tools
+    "read", "write", "edit", "bash", "glob", "grep",
+    "webfetch", "task", "todowrite",
+}
+
+
 def format_tools_for_prompt(tools: list[dict[str, Any]]) -> str:
-    """Convert OpenAI-format tools array to plain text for prompt injection."""
+    """Convert OpenAI-format tools array to compressed TS-like signatures.
+    
+    Uses compact notation for ~90% space savings vs verbose JSON Schema.
+    Priority tools get full param expansion; others get name+desc only when >12 tools.
+    """
     lines = []
+    expand_all = len(tools) <= 12
+    
     for tool in tools:
         if tool.get("type") != "function":
             continue
@@ -61,24 +110,19 @@ def format_tools_for_prompt(tools: list[dict[str, Any]]) -> str:
         desc = func.get("description", "")
         params = func.get("parameters", {})
         
-        lines.append(f"工具名：{name}")
-        if desc:
-            lines.append(f"描述：{desc}")
+        is_priority = expand_all or name in PRIORITY_TOOLS
         
-        # Format parameters
-        props = params.get("properties", {})
-        required = set(params.get("required", []))
-        if props:
-            param_parts = []
-            for pname, pinfo in props.items():
-                ptype = pinfo.get("type", "string")
-                pdesc = pinfo.get("description", "")
-                req = "必填" if pname in required else "可选"
-                param_parts.append(f'"{pname}": "{ptype}, {req}, {pdesc}"')
-            lines.append(f"参数：{{{', '.join(param_parts)}}}")
-        lines.append("")  # blank line between tools
+        if is_priority:
+            sig = _compress_params(params)
+            # Truncate description to 120 chars for prompt space
+            short_desc = desc[:120] + "..." if len(desc) > 120 else desc
+            lines.append(f"- {name}{sig}: {short_desc}")
+        else:
+            # Minimal: just name and short description
+            short_desc = desc[:80] + "..." if len(desc) > 80 else desc
+            lines.append(f"- {name}: {short_desc}")
     
-    return "\n".join(lines).strip()
+    return "\n".join(lines)
 
 
 def build_tool_system_prompt(tools: list[dict[str, Any]]) -> str:
@@ -319,10 +363,12 @@ def convert_messages_with_tools(
     - Injects tool system prompt
     - Converts role:assistant with tool_calls to official format
     - Converts role:tool results to readable text
-    - Smart truncation to stay within token limits
+    - Smart truncation: preserves first user message (original task)
+    - CURRENT TASK injection for multi-step tool chains
     """
     tool_system = build_tool_system_prompt(tools)
     parts = []
+    first_user_msg = None  # Track the original task
     
     for msg in messages:
         role = msg.get("role", "")
@@ -349,61 +395,80 @@ def convert_messages_with_tools(
                 parts.append(f"[assistant]: {content}")
         
         elif role == "user":
+            text = ""
             if isinstance(content, str):
-                parts.append(f"[user]: {content}")
+                text = content
             elif isinstance(content, list):
                 text_parts = [p.get("text", "") for p in content 
                              if isinstance(p, dict) and p.get("type") == "text"]
-                if text_parts:
-                    parts.append(f"[user]: {''.join(text_parts)}")
+                text = "".join(text_parts)
+            if text:
+                if first_user_msg is None:
+                    first_user_msg = text
+                parts.append(f"[user]: {text}")
     
     # If no system message was found, prepend tool system prompt
     if not any(m.get("role") == "system" for m in messages):
         parts.insert(0, f"[system]: {tool_system}")
     
+    # Clean refusals from history to prevent cascade
+    parts = clean_refusals_from_history(parts)
+    
     result = "\n\n".join(parts)
     
     # If still over limit after per-result truncation, drop oldest tool rounds
     if len(result) > max_chars:
-        result = _drop_old_rounds(parts, max_chars)
+        result = _drop_old_rounds(parts, max_chars, first_user_msg)
     
     return result
 
 
-def _drop_old_rounds(parts: list[str], max_chars: int) -> str:
+def _drop_old_rounds(parts: list[str], max_chars: int, first_user_msg: Optional[str] = None) -> str:
     """Drop oldest tool call/result pairs until under the limit.
     
     Strategy:
     1. If system prompt is too large, truncate it
-    2. Always keep the user message and most recent tool rounds
-    3. Drop oldest tool rounds first
+    2. Always preserve first user message (original task) for context
+    3. Keep most recent tool rounds
+    4. Inject CURRENT TASK reminder if rounds were dropped
     """
     if not parts:
         return ""
     
     header = parts[0]  # system prompt (may be very large)
     
-    # If header alone exceeds 60% of budget, truncate it
-    max_header = int(max_chars * 0.6)
+    # If header alone exceeds 50% of budget, truncate it aggressively
+    max_header = int(max_chars * 0.5)
     if len(header) > max_header:
-        # Keep the tool instruction part (last ~2000 chars) and truncate the system prompt
-        # Find where tool instructions start
-        tool_marker = "当你需要调用工具时"
+        # Keep the tool instruction part and truncate the system prompt
+        tool_marker = "## 可用工具"
         marker_pos = header.find(tool_marker)
         if marker_pos > 0:
-            # Keep: first 2000 chars of system + all tool instructions
-            sys_prefix = header[:2000]
-            tool_instructions = header[marker_pos - 200:]  # include some context before marker
+            # Keep: first 1500 chars of system + all tool instructions
+            sys_prefix = header[:1500]
+            tool_instructions = header[marker_pos:]
             header = sys_prefix + "\n\n[... system prompt truncated ...]\n\n" + tool_instructions
         else:
             header = header[:max_header] + "\n[... truncated ...]"
+        # If still too large, truncate tool definitions too
+        if len(header) > max_header:
+            header = header[:max_header] + "\n[... truncated ...]"
+    
+    # Build CURRENT TASK reminder from first user message
+    task_reminder = ""
+    if first_user_msg:
+        # Truncate to 500 chars max
+        task_text = first_user_msg[:500]
+        if len(first_user_msg) > 500:
+            task_text += "..."
+        task_reminder = f"\n\n[CURRENT TASK]: {task_text}"
     
     # Calculate budget for conversation history
-    budget = max_chars - len(header) - 200
+    budget = max_chars - len(header) - len(task_reminder) - 200
     
     # Ensure minimum budget for at least some history
     if budget < 5000:
-        budget = 5000  # Force at least 5K chars for recent context
+        budget = 5000
     
     # Keep parts from the end (most recent first)
     kept_tail = []
@@ -419,14 +484,17 @@ def _drop_old_rounds(parts: list[str], max_chars: int) -> str:
     
     # If we couldn't keep anything, force-keep at least the last 2 parts
     if not kept_tail and len(parts) > 1:
-        kept_tail = parts[-2:]  # last user msg + last tool result
-        # Truncate these if needed
+        kept_tail = parts[-2:]
         kept_tail = [p[:3000] if len(p) > 3000 else p for p in kept_tail]
     
     dropped_count = len(parts) - 1 - len(kept_tail)
     if dropped_count > 0:
         marker = f"[... {dropped_count} earlier messages omitted ...]"
-        return "\n\n".join([header, marker] + kept_tail)
+        result_parts = [header, marker]
+        if task_reminder:
+            result_parts.append(task_reminder)
+        result_parts.extend(kept_tail)
+        return "\n\n".join(result_parts)
     else:
         return "\n\n".join([header] + kept_tail)
 
@@ -445,3 +513,131 @@ def _reconstruct_tool_calls_xml(tool_calls: list[dict[str, Any]]) -> str:
         obj = {"name": name, "arguments": args}
         parts.append(f"<tool_call>\n{json.dumps(obj, ensure_ascii=False)}\n</tool_call>")
     return "\n".join(parts)
+
+
+# ── Refusal Cleaning ──
+# Patterns that indicate model refusal (cascade prevention)
+_REFUSAL_PATTERNS = [
+    re.compile(r"(?i)i('m| am) (sorry|unable|not able|cannot)", re.DOTALL),
+    re.compile(r"(?i)i can'?t (help|assist|do|provide|fulfill)", re.DOTALL),
+    re.compile(r"(?i)as an ai (language model|assistant)", re.DOTALL),
+    re.compile(r"(?i)i('m| am) not (allowed|permitted|able)", re.DOTALL),
+    re.compile(r"(?i)(抱歉|对不起|很遗憾).{0,20}(无法|不能|做不到)", re.DOTALL),
+    re.compile(r"(?i)作为(一个)?(AI|人工智能|语言模型)", re.DOTALL),
+    re.compile(r"(?i)我(无法|不能|没有能力)(帮助|协助|完成|执行)", re.DOTALL),
+    re.compile(r"(?i)this (request|task) (is|goes) (beyond|against)", re.DOTALL),
+    re.compile(r"(?i)i (don'?t|do not) have (the ability|access|permission)", re.DOTALL),
+    re.compile(r"(?i)违反.{0,10}(政策|规定|准则)", re.DOTALL),
+]
+
+_REFUSAL_REPLACEMENT = "[earlier assistant turn omitted by proxy]"
+
+
+def clean_refusals_from_history(parts: list[str]) -> list[str]:
+    """Remove refusal text from assistant messages in history.
+    
+    Prevents cascade refusals where model sees its own prior refusal
+    and repeats it. Only cleans assistant messages, preserves tool_call blocks.
+    """
+    cleaned = []
+    for part in parts:
+        if not part.startswith("[assistant]:"):
+            cleaned.append(part)
+            continue
+        # Don't clean if it contains tool_call (useful context)
+        if "<tool_call>" in part:
+            cleaned.append(part)
+            continue
+        # Check for refusal patterns
+        content = part[len("[assistant]: "):]
+        is_refusal = any(p.search(content) for p in _REFUSAL_PATTERNS)
+        if is_refusal:
+            cleaned.append(f"[assistant]: {_REFUSAL_REPLACEMENT}")
+        else:
+            cleaned.append(part)
+    return cleaned
+
+
+# ── Streaming Guard ──
+class StreamingGuard:
+    """Buffer for streaming output to detect incomplete tool_call tags.
+    
+    Accumulates initial chars (warmup) before emitting, and keeps a guard
+    window at the tail to detect cross-chunk tool_call boundaries.
+    """
+    
+    WARMUP_CHARS = 80       # Buffer before first emit
+    GUARD_WINDOW = 200      # Tail buffer for cross-chunk detection
+    
+    def __init__(self):
+        self._buffer = ""
+        self._emitted = 0
+        self._warmed_up = False
+    
+    def feed(self, chunk: str) -> str:
+        """Feed a chunk, return text safe to emit (may be empty during warmup)."""
+        self._buffer += chunk
+        
+        if not self._warmed_up:
+            if len(self._buffer) < self.WARMUP_CHARS:
+                return ""
+            self._warmed_up = True
+        
+        # Keep guard window at tail
+        safe_end = len(self._buffer) - self.GUARD_WINDOW
+        if safe_end <= self._emitted:
+            return ""
+        
+        emit = self._buffer[self._emitted:safe_end]
+        self._emitted = safe_end
+        return emit
+    
+    def flush(self) -> str:
+        """Flush remaining buffer (call at stream end)."""
+        if self._emitted < len(self._buffer):
+            emit = self._buffer[self._emitted:]
+            self._emitted = len(self._buffer)
+            return emit
+        return ""
+    
+    @property
+    def full_buffer(self) -> str:
+        """Get the complete accumulated buffer."""
+        return self._buffer
+    
+    def has_incomplete_tool_call(self) -> bool:
+        """Check if buffer has an opening <tool_call> without matching close."""
+        opens = self._buffer.count("<tool_call>")
+        closes = self._buffer.count("</tool_call>")
+        return opens > closes
+
+
+# ── Truncation Auto-Continue Detection ──
+
+def detect_truncated_tool_call(text: str) -> bool:
+    """Detect if model output was truncated mid-tool-call.
+    
+    Returns True if there's an unclosed <tool_call> tag or incomplete JSON.
+    """
+    opens = text.count("<tool_call>")
+    closes = text.count("</tool_call>")
+    if opens > closes:
+        return True
+    # Check for trailing incomplete JSON (starts with { but no matching })
+    stripped = text.rstrip()
+    if stripped.endswith(("{", '{"', '"name"')):
+        return True
+    return False
+
+
+def build_continuation_prompt(original_output: str, max_anchor: int = 2000) -> str:
+    """Build a prompt to continue from where the model was truncated.
+    
+    Takes the tail of the original output as anchor context.
+    """
+    anchor = original_output[-max_anchor:] if len(original_output) > max_anchor else original_output
+    return (
+        f"你的上一次回复在输出过程中被截断了。以下是你上次输出的末尾部分：\n"
+        f"---\n{anchor}\n---\n"
+        f"请从中断点继续输出，不要重复已输出的内容。"
+    )

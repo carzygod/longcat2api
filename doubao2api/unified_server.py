@@ -36,6 +36,9 @@ from .tool_calling import (
     parse_tool_calls_xml,
     is_tool_call_start,
     has_complete_tool_calls,
+    StreamingGuard,
+    detect_truncated_tool_call,
+    build_continuation_prompt,
 )
 from .token_counter import count_tokens, count_messages_tokens, SAFETY_FACTOR
 
@@ -699,6 +702,24 @@ def create_app(
                 parsed = parse_tool_calls_xml(source)
                 if not parsed and content:
                     parsed = parse_tool_calls_xml(content)
+                
+                # Auto-continue if tool call was truncated
+                if not parsed and detect_truncated_tool_call(source or content):
+                    log.info("Detected truncated tool_call, attempting continuation...")
+                    cont_prompt = build_continuation_prompt(source or content)
+                    cont_messages = messages_for_qw + "\n\n" + cont_prompt if isinstance(messages_for_qw, str) else cont_prompt
+                    try:
+                        cont_result = await qw_client.chat(cont_messages, qw_model, deep_search)
+                        cont_content = cont_result["content"]
+                        cont_content = _think_prefix_re.sub("", cont_content).strip()
+                        # Combine and re-parse
+                        combined = (source or content) + cont_content
+                        parsed = parse_tool_calls_xml(combined)
+                        if parsed:
+                            log.info("Continuation successful, got %d tool calls", len(parsed))
+                    except Exception as e:
+                        log.warning("Continuation failed: %s", e)
+                
                 if parsed:
                     return JSONResponse({
                         "id": request_id,
@@ -864,6 +885,21 @@ def create_app(
             # Also try main content if think didn't have it
             if not parsed and full_content:
                 parsed = parse_tool_calls_xml(full_content)
+            
+            # Auto-continue if truncated
+            if not parsed and detect_truncated_tool_call(source or full_content):
+                log.info("Stream: detected truncated tool_call, attempting continuation...")
+                cont_prompt = build_continuation_prompt(source or full_content)
+                try:
+                    cont_result = await qw_client.chat(cont_prompt, model, deep_search)
+                    cont_content = cont_result.get("content", "")
+                    combined = (source or full_content) + cont_content
+                    parsed = parse_tool_calls_xml(combined)
+                    if parsed:
+                        log.info("Stream continuation got %d tool calls", len(parsed))
+                except Exception as e:
+                    log.warning("Stream continuation failed: %s", e)
+            
             if parsed:
                 for idx, tc in enumerate(parsed):
                     tc_delta = {
