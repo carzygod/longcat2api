@@ -41,6 +41,8 @@ from .tool_calling import (
     build_continuation_prompt,
     filter_history_by_topic,
     ToolNameObfuscator,
+    coerce_tool_arguments,
+    deduplicate_continuation,
 )
 from .token_counter import count_tokens, count_messages_tokens, SAFETY_FACTOR
 
@@ -719,15 +721,13 @@ def create_app(
                 if not parsed and detect_truncated_tool_call(source or content):
                     log.info("Detected truncated tool_call, attempting continuation...")
                     cont_prompt = build_continuation_prompt(source or content)
-                    # messages_for_qw is [{"role": "user", "content": prompt}]
-                    # For continuation, send as a new single-message request
                     cont_messages = [{"role": "user", "content": cont_prompt}]
                     try:
                         cont_result = await qw_client.chat(cont_messages, qw_model, deep_search)
                         cont_content = cont_result["content"]
                         cont_content = _think_prefix_re.sub("", cont_content).strip()
-                        # Combine and re-parse
-                        combined = (source or content) + cont_content
+                        # Deduplicate overlap before combining
+                        combined = deduplicate_continuation(source or content, cont_content)
                         parsed = parse_tool_calls_xml(combined)
                         if parsed:
                             log.info("Continuation successful, got %d tool calls", len(parsed))
@@ -737,6 +737,8 @@ def create_app(
                 if parsed:
                     # Deobfuscate tool names back to original
                     parsed = _tool_obfuscator.deobfuscate_tool_calls(parsed)
+                    # Coerce parameter names to match schema
+                    parsed = coerce_tool_arguments(parsed)
                     return JSONResponse({
                         "id": request_id,
                         "object": "chat.completion",
@@ -910,7 +912,8 @@ def create_app(
                     cont_messages = [{"role": "user", "content": cont_prompt}]
                     cont_result = await qw_client.chat(cont_messages, model, deep_search)
                     cont_content = cont_result.get("content", "")
-                    combined = (source or full_content) + cont_content
+                    # Deduplicate overlap before combining
+                    combined = deduplicate_continuation(source or full_content, cont_content)
                     parsed = parse_tool_calls_xml(combined)
                     if parsed:
                         log.info("Stream continuation got %d tool calls", len(parsed))
@@ -920,6 +923,8 @@ def create_app(
             if parsed:
                 # Deobfuscate tool names back to original
                 parsed = _tool_obfuscator.deobfuscate_tool_calls(parsed)
+                # Coerce parameter names to match schema
+                parsed = coerce_tool_arguments(parsed)
                 for idx, tc in enumerate(parsed):
                     tc_delta = {
                         "role": "assistant",

@@ -415,8 +415,16 @@ def convert_messages_with_tools(
     if not any(m.get("role") == "system" for m in messages):
         parts.insert(0, f"[system]: {tool_system}")
     
+    # Inject few-shot examples after system prompt, before real history
+    fewshot = build_fewshot_examples(tools)
+    if fewshot:
+        parts = parts[:1] + fewshot + parts[1:]
+    
     # Clean refusals from history to prevent cascade
     parts = clean_refusals_from_history(parts)
+    
+    # Context offload: compress very long individual messages
+    parts = offload_long_messages(parts)
     
     result = "\n\n".join(parts)
     
@@ -879,3 +887,397 @@ class ToolNameObfuscator:
             }
             result.append(new_tc)
         return result
+
+
+# ── Few-Shot Injection ──
+# Injects synthetic tool-calling examples before real history to teach
+# the model the correct format and encourage use of diverse tools.
+
+def _select_representative_tools(tools: list[dict[str, Any]], max_examples: int = 3) -> list[dict]:
+    """Select representative tools for few-shot examples.
+    
+    Strategy:
+    - Always include 1 core tool (Read/Edit/Shell)
+    - Pick up to 2 more from different "namespaces" (by prefix/category)
+    """
+    if not tools:
+        return []
+    
+    funcs = []
+    for t in tools:
+        if t.get("type") != "function":
+            continue
+        f = t.get("function", {})
+        if f.get("name"):
+            funcs.append(f)
+    
+    if not funcs:
+        return []
+    
+    # Categorize: core vs others
+    core_names = {"Read", "Edit", "Shell", "Bash", "Write", "Glob", "Grep",
+                  "read", "edit", "shell", "bash", "write", "glob", "grep",
+                  "fs_read_file", "fs_edit_file", "exec_shell", "exec_command"}
+    
+    core = [f for f in funcs if f["name"] in core_names]
+    others = [f for f in funcs if f["name"] not in core_names]
+    
+    selected = []
+    # Pick 1 core tool
+    if core:
+        selected.append(core[0])
+    
+    # Pick from others (prefer those with longer descriptions = more complex)
+    others.sort(key=lambda f: len(f.get("description", "")), reverse=True)
+    
+    # Deduplicate by "namespace" (first word or prefix before _)
+    seen_ns = set()
+    for f in others:
+        ns = f["name"].split("_")[0].split(".")[0].lower()
+        if ns not in seen_ns and len(selected) < max_examples:
+            selected.append(f)
+            seen_ns.add(ns)
+    
+    return selected
+
+
+def _build_fewshot_example(func: dict) -> tuple[str, str]:
+    """Build a synthetic user->assistant example for a tool.
+    
+    Returns (user_msg, assistant_msg) tuple.
+    """
+    name = func.get("name", "tool")
+    params = func.get("parameters", {})
+    props = params.get("properties", {})
+    required = set(params.get("required", []))
+    
+    # Build a minimal valid arguments dict
+    args = {}
+    for pname, pinfo in props.items():
+        if pname not in required:
+            continue
+        ptype = pinfo.get("type", "string")
+        if ptype == "string":
+            args[pname] = f"example_{pname}"
+        elif ptype == "integer":
+            args[pname] = 1
+        elif ptype == "boolean":
+            args[pname] = True
+        elif ptype == "array":
+            args[pname] = []
+        else:
+            args[pname] = f"example_{pname}"
+    
+    user_msg = f"[example] use {name}"
+    assistant_msg = (
+        f'<tool_call>\n'
+        f'{json.dumps({"name": name, "arguments": args}, ensure_ascii=False)}\n'
+        f'</tool_call>'
+    )
+    return user_msg, assistant_msg
+
+
+def build_fewshot_examples(tools: list[dict[str, Any]]) -> list[str]:
+    """Build few-shot example parts to inject before real conversation.
+    
+    Returns list of parts in the same format as convert_messages_with_tools.
+    Only generates examples when there are >5 tools (simple cases don't need it).
+    """
+    if len(tools) <= 5:
+        return []
+    
+    representatives = _select_representative_tools(tools)
+    if not representatives:
+        return []
+    
+    parts = []
+    for func in representatives:
+        user_msg, assistant_msg = _build_fewshot_example(func)
+        parts.append(f"[user]: {user_msg}")
+        parts.append(f"[assistant]: {assistant_msg}")
+    
+    return parts
+
+
+# ── Context Offload ──
+# When individual messages are extremely long, compress them aggressively
+# to free up context budget. Unlike qwen2API which uploads files,
+# we use in-place summarization (head + tail + byte count).
+
+# Thresholds for context offload
+OFFLOAD_MSG_THRESHOLD = 8000   # Messages longer than this get offloaded
+OFFLOAD_HEAD_CHARS = 2000      # Keep this many chars from the start
+OFFLOAD_TAIL_CHARS = 800       # Keep this many chars from the end
+
+
+def offload_long_messages(parts: list[str], threshold: int = OFFLOAD_MSG_THRESHOLD) -> list[str]:
+    """Compress messages that exceed the threshold.
+    
+    For very long messages (typically tool results or system prompts),
+    keep head + tail and replace the middle with a size marker.
+    This is the equivalent of qwen2API's context_offload but without
+    requiring file upload infrastructure.
+    
+    Skips the first part (system prompt) — that's handled by _drop_old_rounds.
+    """
+    if not parts:
+        return parts
+    
+    result = [parts[0]]  # Keep system prompt as-is (handled elsewhere)
+    
+    for part in parts[1:]:
+        if len(part) <= threshold:
+            result.append(part)
+            continue
+        
+        # Determine what kind of message this is
+        if part.startswith("[工具调用结果]"):
+            # Tool result: keep head + tail
+            head = part[:OFFLOAD_HEAD_CHARS]
+            tail = part[-OFFLOAD_TAIL_CHARS:]
+            omitted = len(part) - OFFLOAD_HEAD_CHARS - OFFLOAD_TAIL_CHARS
+            result.append(
+                f"{head}\n\n[... content offloaded: {omitted} chars omitted ...]\n\n{tail}"
+            )
+        elif part.startswith("[user]:"):
+            # User message: keep more context (might be the task description)
+            head = part[:4000]
+            tail = part[-1000:]
+            omitted = len(part) - 5000
+            result.append(
+                f"{head}\n\n[... {omitted} chars omitted ...]\n\n{tail}"
+            )
+        elif part.startswith("[assistant]:"):
+            # Assistant message: if it's a tool call, keep it; otherwise compress
+            if "<tool_call>" in part:
+                result.append(part)  # Don't compress tool calls
+            else:
+                head = part[:1500]
+                omitted = len(part) - 1500
+                result.append(f"{head}\n[... {omitted} chars omitted ...]")
+        else:
+            # Unknown format: generic compression
+            head = part[:OFFLOAD_HEAD_CHARS]
+            tail = part[-OFFLOAD_TAIL_CHARS:]
+            omitted = len(part) - OFFLOAD_HEAD_CHARS - OFFLOAD_TAIL_CHARS
+            result.append(
+                f"{head}\n[... {omitted} chars omitted ...]\n{tail}"
+            )
+    
+    return result
+
+
+# ── Parameter Name Coercion ──
+# Maps commonly wrong parameter names to the correct ones.
+# The model sometimes uses generic names instead of the exact schema names.
+
+# Mapping: {tool_name: {wrong_param: correct_param}}
+_PARAM_COERCION_MAP = {
+    "Read": {
+        "path": "filePath",
+        "file_path": "filePath",
+        "file": "filePath",
+        "filename": "filePath",
+        "filepath": "filePath",
+    },
+    "Write": {
+        "path": "filePath",
+        "file_path": "filePath",
+        "file": "filePath",
+        "text": "content",
+        "data": "content",
+    },
+    "Edit": {
+        "path": "filePath",
+        "file_path": "filePath",
+        "file": "filePath",
+        "old": "oldString",
+        "old_string": "oldString",
+        "new": "newString",
+        "new_string": "newString",
+        "search": "oldString",
+        "replace": "newString",
+    },
+    "Shell": {
+        "cmd": "command",
+        "exec": "command",
+        "run": "command",
+        "desc": "description",
+    },
+    "Bash": {
+        "cmd": "command",
+        "exec": "command",
+        "run": "command",
+        "desc": "description",
+    },
+    "Glob": {
+        "glob": "pattern",
+        "path": "pattern",
+    },
+    "Grep": {
+        "query": "pattern",
+        "search": "pattern",
+        "regex": "pattern",
+        "path": "include",
+        "file_pattern": "include",
+    },
+    "WebFetch": {
+        "link": "url",
+        "href": "url",
+        "address": "url",
+    },
+    # Obfuscated names
+    "fs_read_file": {
+        "path": "filePath",
+        "file_path": "filePath",
+        "file": "filePath",
+    },
+    "fs_write_file": {
+        "path": "filePath",
+        "file_path": "filePath",
+        "text": "content",
+    },
+    "fs_edit_file": {
+        "path": "filePath",
+        "file_path": "filePath",
+        "old": "oldString",
+        "new": "newString",
+    },
+    "exec_shell": {
+        "cmd": "command",
+        "exec": "command",
+        "desc": "description",
+    },
+    "exec_command": {
+        "cmd": "command",
+        "exec": "command",
+        "desc": "description",
+    },
+}
+
+
+def coerce_tool_arguments(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fix common parameter name mistakes in tool calls.
+    
+    Maps wrong parameter names to correct ones based on the tool name.
+    Modifies tool_calls in place and returns them.
+    """
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        name = func.get("name", "")
+        args_str = func.get("arguments", "{}")
+        
+        coercion = _PARAM_COERCION_MAP.get(name)
+        if not coercion:
+            continue
+        
+        try:
+            args = json.loads(args_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        
+        if not isinstance(args, dict):
+            continue
+        
+        # Apply coercion: rename wrong keys to correct keys
+        changed = False
+        new_args = {}
+        for key, value in args.items():
+            if key in coercion:
+                correct_key = coercion[key]
+                # Don't overwrite if correct key already exists
+                if correct_key not in args:
+                    new_args[correct_key] = value
+                    changed = True
+                else:
+                    new_args[key] = value  # Keep original if conflict
+            else:
+                new_args[key] = value
+        
+        if changed:
+            log.info("Coerced params for %s: %s", name,
+                     {k: coercion[k] for k in args if k in coercion})
+            func["arguments"] = json.dumps(new_args, ensure_ascii=False)
+    
+    return tool_calls
+
+
+# ── Deduplication for Continuation ──
+# When auto-continue produces overlapping content, deduplicate the join point.
+
+def _find_longest_overlap(text_a: str, text_b: str, max_check: int = 500) -> int:
+    """Find the longest suffix of text_a that is a prefix of text_b.
+    
+    Returns the length of the overlap (0 if none found).
+    Checks up to max_check characters for performance.
+    """
+    # Limit search window
+    suffix_window = text_a[-max_check:] if len(text_a) > max_check else text_a
+    prefix_window = text_b[:max_check] if len(text_b) > max_check else text_b
+    
+    best = 0
+    # Try decreasing overlap lengths
+    max_possible = min(len(suffix_window), len(prefix_window))
+    for length in range(max_possible, 0, -1):
+        if suffix_window[-length:] == prefix_window[:length]:
+            best = length
+            break
+    
+    return best
+
+
+def _find_line_overlap(text_a: str, text_b: str, max_lines: int = 20) -> int:
+    """Find overlap at line boundaries (more robust than char-level).
+    
+    Returns number of characters to skip from text_b.
+    """
+    lines_a = text_a.split("\n")
+    lines_b = text_b.split("\n")
+    
+    # Check last N lines of A against first N lines of B
+    tail_lines = lines_a[-max_lines:] if len(lines_a) > max_lines else lines_a
+    head_lines = lines_b[:max_lines] if len(lines_b) > max_lines else lines_b
+    
+    # Find longest matching sequence
+    best_overlap_chars = 0
+    for start in range(len(tail_lines)):
+        match_len = 0
+        for i in range(min(len(tail_lines) - start, len(head_lines))):
+            if tail_lines[start + i].strip() == head_lines[i].strip():
+                match_len += 1
+            else:
+                break
+        if match_len >= 2:  # At least 2 matching lines
+            # Calculate chars to skip
+            overlap_chars = sum(len(line) + 1 for line in head_lines[:match_len])
+            if overlap_chars > best_overlap_chars:
+                best_overlap_chars = overlap_chars
+    
+    return best_overlap_chars
+
+
+def deduplicate_continuation(original: str, continuation: str) -> str:
+    """Join original output with continuation, removing any overlap.
+    
+    Uses both character-level and line-level overlap detection.
+    Returns the combined, deduplicated text.
+    """
+    if not continuation:
+        return original
+    if not original:
+        return continuation
+    
+    # Try line-level overlap first (more robust)
+    line_overlap = _find_line_overlap(original, continuation)
+    
+    # Try character-level overlap
+    char_overlap = _find_longest_overlap(original, continuation)
+    
+    # Use the larger overlap
+    overlap = max(line_overlap, char_overlap)
+    
+    if overlap > 0:
+        log.info("Deduplication: removed %d chars of overlap", overlap)
+        return original + continuation[overlap:]
+    else:
+        return original + continuation
