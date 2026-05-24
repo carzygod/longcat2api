@@ -650,6 +650,10 @@ def create_app(
         has_tools = bool(body.tools)
         if has_tools:
             prompt = convert_messages_with_tools(messages_raw, body.tools)
+            log.info("Qianwen tool prompt: %d chars, %d messages in request",
+                     len(prompt), len(messages_raw))
+            if len(prompt) > 50000:
+                log.warning("Qianwen prompt VERY LONG: %d chars — may hit API limit!", len(prompt))
             # Wrap as single user message for Qianwen
             messages_for_qw = [{"role": "user", "content": prompt}]
         else:
