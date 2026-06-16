@@ -1521,6 +1521,8 @@ class BrowserClient:
         prompt: str,
         ratio: Optional[str] = None,
         ref_image_key: Optional[str] = None,
+        model: Optional[str] = None,
+        duration: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Generate video using /samantha/chat/completion (async 2-step).
 
@@ -1539,6 +1541,10 @@ class BrowserClient:
             content_data["ratio"] = ratio
         if ref_image_key:
             content_data["ref_image_key"] = ref_image_key
+        if model:
+            content_data["model"] = model
+        if duration:
+            content_data["duration"] = int(duration)
 
         message: Dict[str, Any] = {
             "content": json.dumps(content_data, ensure_ascii=False),

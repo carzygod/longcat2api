@@ -274,6 +274,19 @@ def is_quota_exhaustion_message(message: str) -> bool:
     return any(marker in text for marker in markers)
 
 
+def is_video_acceptance_message(message: str) -> bool:
+    text = message or ""
+    markers = (
+        "正在为您生成视频",
+        "预计等待",
+        "生成好后",
+        "视频生成好后",
+        "will notify",
+        "generating video",
+    )
+    return any(marker.lower() in text.lower() for marker in markers)
+
+
 def create_app(
     *,
     api_key: Optional[str] = None,
@@ -634,6 +647,18 @@ def create_app(
                 model=params.get("provider_model"),
                 duration=params.get("duration"),
             )
+            if not result.get("videos") and is_video_acceptance_message(str(result.get("message") or "")):
+                log.info("generate_video_web accepted async task without URL; falling back to Samantha task polling")
+                fallback = await client.generate_video(
+                    prompt=params["prompt"],
+                    ratio=params.get("ratio"),
+                    ref_image_key=ref_image_key,
+                    model=params.get("provider_model"),
+                    duration=params.get("duration"),
+                )
+                if fallback.get("videos"):
+                    fallback["message"] = result.get("message") or fallback.get("message", "")
+                    result = fallback
         except HTTPException:
             accounts.release_quota(reservation_id)
             raise

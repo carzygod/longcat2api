@@ -9,25 +9,28 @@ MODULE_PATH = ROOT / "doubao2api" / "unified_server.py"
 
 def load_quota_helper():
     tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
-    helper = next(
+    helpers = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "is_quota_exhaustion_message"
-    )
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"is_quota_exhaustion_message", "is_video_acceptance_message"}
+    ]
     module = ast.Module(
         body=[
             ast.Import(names=[ast.alias(name="re")]),
-            helper,
+            *helpers,
         ],
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
     namespace = {}
     exec(compile(module, str(MODULE_PATH), "exec"), namespace)
-    return namespace["is_quota_exhaustion_message"]
+    return namespace
 
 
-is_quota_exhaustion_message = load_quota_helper()
+helpers = load_quota_helper()
+is_quota_exhaustion_message = helpers["is_quota_exhaustion_message"]
+is_video_acceptance_message = helpers["is_video_acceptance_message"]
 
 
 class VideoQuotaErrorTest(unittest.TestCase):
@@ -42,6 +45,14 @@ class VideoQuotaErrorTest(unittest.TestCase):
         self.assertTrue(is_quota_exhaustion_message("今日剩余 0 个视频生成额度"))
         self.assertTrue(is_quota_exhaustion_message("视频生成额度不足"))
         self.assertTrue(is_quota_exhaustion_message("quota exceeded"))
+
+    def test_video_acceptance_message_is_detected(self):
+        self.assertTrue(
+            is_video_acceptance_message(
+                "正在为您生成视频，预计等待 1-3分钟。视频生成好后，我会及时通知你。"
+            )
+        )
+        self.assertFalse(is_video_acceptance_message("视频生成额度不足"))
 
 
 if __name__ == "__main__":
