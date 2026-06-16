@@ -13,9 +13,12 @@ Start with:
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import collections
 import json
 import logging
+import mimetypes
 import os
 import time
 import uuid
@@ -484,7 +487,9 @@ def create_app(
             "provider_model": requested_model,
             "ratio": ratio,
             "duration": duration,
-            "ref_image_key": body.get("ref_image_key") or body.get("image_key"),
+            "ref_image_key": body.get("ref_image_key") or body.get("image_key") or body.get("file_id"),
+            "image_url": body.get("image_url"),
+            "image": body.get("image"),
             "account_id": str(body.get("account_id") or body.get("doubao_account_id") or body.get("account") or "").strip() or None,
             "explicit_account_id": bool(body.get("account_id") or body.get("doubao_account_id") or body.get("account")),
         }
@@ -538,6 +543,44 @@ def create_app(
         accounts.mark_failure(account["id"], message)
         return retry_next
 
+    async def _materialize_video_ref_image_key(
+        client: BrowserClient,
+        params: Dict[str, Any],
+    ) -> Optional[str]:
+        ref_image_key = params.get("ref_image_key")
+        if ref_image_key:
+            return str(ref_image_key)
+
+        image_value = str(params.get("image") or params.get("image_url") or "").strip()
+        if not image_value:
+            return None
+
+        filename = "video-start-frame.png"
+        image_bytes: bytes
+        if image_value.startswith("data:"):
+            try:
+                header, encoded = image_value.split(",", 1)
+                mime_type = header[5:].split(";", 1)[0]
+                ext = mimetypes.guess_extension(mime_type) or ".png"
+                filename = f"video-start-frame{ext}"
+                image_bytes = base64.b64decode(encoded)
+            except (ValueError, TypeError, binascii.Error) as exc:
+                raise HTTPException(status_code=400, detail="Invalid image data URI") from exc
+        elif image_value.startswith("http://") or image_value.startswith("https://"):
+            parsed_name = image_value.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+            if parsed_name:
+                filename = parsed_name
+            async with httpx.AsyncClient(timeout=120) as image_client:
+                resp = await image_client.get(image_value)
+                resp.raise_for_status()
+                image_bytes = resp.content
+        else:
+            # Treat opaque values as an already uploaded upstream image/file key.
+            return image_value
+
+        uploaded = await client.upload_image(image_bytes=image_bytes, filename=filename)
+        return uploaded.get("uri") or uploaded.get("cdn_url")
+
     async def _execute_video_generation_once(params: Dict[str, Any], request: Optional[Request] = None) -> Dict[str, Any]:
         await bucket.acquire()
         quota_units = int(params.get("quota_units") or _video_quota_units(params))
@@ -566,13 +609,18 @@ def create_app(
             params["quota_reservation_id"] = reservation_id
             params["quota_units"] = quota_units
         try:
+            ref_image_key = await _materialize_video_ref_image_key(client, params)
+            params["ref_image_key"] = ref_image_key
             result = await client.generate_video_web(
                 prompt=params["prompt"],
                 ratio=params.get("ratio"),
-                ref_image_key=params.get("ref_image_key"),
+                ref_image_key=ref_image_key,
                 model=params.get("provider_model"),
                 duration=params.get("duration"),
             )
+        except HTTPException:
+            accounts.release_quota(reservation_id)
+            raise
         except RuntimeError as exc:
             retry_next = await _handle_video_attempt_failure(account, client, reservation_id, str(exc))
             raise _VideoAttemptFailed(account["id"], str(exc), retry_next)
@@ -650,15 +698,27 @@ def create_app(
                 )
 
     def _format_video_task(task: Dict[str, Any]) -> Dict[str, Any]:
+        status_map = {
+            "queued": "queued",
+            "in_progress": "running",
+            "running": "running",
+            "completed": "completed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "canceled": "cancelled",
+        }
+        status = status_map.get(str(task["status"]), str(task["status"]))
         response: Dict[str, Any] = {
             "id": task["task_id"],
             "task_id": task["task_id"],
             "object": "video.generation.task",
             "created": task["created"],
             "updated": task["updated"],
-            "status": task["status"],
+            "status": status,
             "model": task.get("model") or "doubao-video",
+            "provider": "DOUBAO-WEB-01",
             "prompt": task["prompt"],
+            "poll_url": f"/v1/video/generations/{task['task_id']}",
         }
         if task.get("provider_model"):
             response["provider_model"] = task["provider_model"]
@@ -671,10 +731,11 @@ def create_app(
         if task.get("message"):
             response["message"] = task["message"]
         if task.get("error"):
+            err_code = "quota_exhausted" if _looks_quota_error(str(task["error"])) else "video_generation_failed"
             response["error"] = {
                 "message": task["error"],
-                "type": "api_error",
-                "code": "video_generation_failed",
+                "type": "provider_quota_exhausted" if err_code == "quota_exhausted" else "api_error",
+                "code": err_code,
             }
         if task.get("result_json"):
             try:
@@ -697,6 +758,12 @@ def create_app(
         return response
 
     async def _run_video_task(task_id: str, params: Dict[str, Any]) -> None:
+        existing = video_tasks.get(task_id)
+        if existing and existing.get("status") == "cancelled":
+            reservation_id = params.get("quota_reservation_id")
+            if reservation_id:
+                accounts.release_quota(str(reservation_id))
+            return
         video_tasks.update(task_id, "in_progress")
         try:
             result = await _execute_video_generation(params)
@@ -711,6 +778,9 @@ def create_app(
             video_tasks.update(task_id, "failed", error=message, message=message)
             return
         message = result.get("message", "")
+        current = video_tasks.get(task_id)
+        if current and current.get("status") == "cancelled":
+            return
         video_tasks.update(
             task_id,
             "completed",
@@ -1479,6 +1549,23 @@ def create_app(
         task = video_tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Video task not found")
+        return JSONResponse(_format_video_task(task))
+
+    @app.post("/v1/videos/generations/{task_id}/cancel")
+    @app.post("/v1/video/generations/{task_id}/cancel")
+    async def cancel_video_generation(task_id: str, request: Request):
+        _check_auth(request)
+        task = video_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Video task not found")
+        if task.get("status") not in {"completed", "failed", "cancelled"}:
+            video_tasks.update(
+                task_id,
+                "cancelled",
+                error="cancelled",
+                message="Task was cancelled locally.",
+            )
+            task = video_tasks.get(task_id) or task
         return JSONResponse(_format_video_task(task))
 
     @app.post("/v1/files")

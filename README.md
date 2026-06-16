@@ -1560,7 +1560,9 @@ Video generation now supports NewAPI-style asynchronous tasks by default.
 The create call returns a `task_id`; poll
 `GET /v1/video/generations/{task_id}` until `status` becomes `completed` or
 `failed`. The plural alias `POST /v1/videos/generations` and
-`GET /v1/videos/generations/{task_id}` are also available.
+`GET /v1/videos/generations/{task_id}` are also available. Local cancel is
+available via `POST /v1/video/generations/{task_id}/cancel` and
+`POST /v1/videos/generations/{task_id}/cancel`.
 
 Legacy synchronous callers can pass `wait: true`, `sync: true`,
 `blocking: true`, or `async: false`, or call
@@ -1575,6 +1577,9 @@ Supported video request fields:
 | `video_model` / `provider_model` | string | no | Optional upstream model override. Doubao Web currently uses `seedance_v2.0` internally for Seedance 2.0 Fast. |
 | `ratio` / `aspect_ratio` | string | no | `1:1`, `16:9`, `9:16`; OpenAI-style `size` such as `1792x1024` is also mapped. |
 | `duration` / `duration_seconds` / `seconds` | number | no | Video duration in seconds. Defaults to `DOUBAO_VIDEO_DURATION` or `10`. |
+| `ref_image_key` / `image_key` / `file_id` | string | no | Already uploaded Doubao image/file key for image-to-video. |
+| `image_url` | string | no | HTTP image URL; the provider downloads and uploads it to Doubao before generation. |
+| `image` | string | no | Data URI/base64 image; the provider uploads it to Doubao before generation. |
 | `wait` / `sync` / `blocking` | boolean | no | Set true for legacy synchronous response. |
 
 Async create response:
@@ -1588,6 +1593,8 @@ Async create response:
   "updated": 1700000000,
   "status": "queued",
   "model": "doubao-video",
+  "provider": "DOUBAO-WEB-01",
+  "poll_url": "/v1/video/generations/video-...",
   "prompt": "..."
 }
 ```
@@ -1602,7 +1609,9 @@ Completed task response:
   "created": 1700000000,
   "updated": 1700000120,
   "status": "completed",
+  "provider": "DOUBAO-WEB-01",
   "url": "https://...",
+  "video_url": "https://...",
   "data": [
     {"video_url": "https://...", "cover_url": "https://...", "duration": 10.0, "width": 1920, "height": 1080}
   ],
@@ -1617,7 +1626,7 @@ Completed task response:
 }
 ```
 
-视频生成端点。当前接口会在请求内等待任务结果，成功后直接返回视频列表。
+视频生成端点默认异步返回任务，成功后在任务查询接口返回视频列表。
 
 **请求体**：
 ```json
@@ -1633,8 +1642,10 @@ Completed task response:
 | `prompt` | string | 是 | 视频描述 |
 | `model` | string | 否 | 固定 `doubao-video` |
 | `ratio` | string | 否 | `1:1`/`16:9`/`9:16`，也可传 OpenAI 风格 `size` 后自动映射 |
+| `duration` | number | 否 | 秒数 |
+| `image_url`/`image`/`file_id` | string | 否 | 图生视频首帧来源 |
 
-**响应**：
+**同步响应**：
 ```json
 {
   "created": 1700000000,
