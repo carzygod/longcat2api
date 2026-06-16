@@ -657,13 +657,21 @@ def create_app(
         try:
             ref_image_key = await _materialize_video_ref_image_key(client, params)
             params["ref_image_key"] = ref_image_key
-            result = await client.generate_video(
-                prompt=params["prompt"],
-                ratio=params.get("ratio"),
-                ref_image_key=ref_image_key,
-                model=params.get("provider_model"),
-                duration=params.get("duration"),
-            )
+            try:
+                result = await client.generate_video(
+                    prompt=params["prompt"],
+                    ratio=params.get("ratio"),
+                    ref_image_key=ref_image_key,
+                    model=params.get("provider_model"),
+                    duration=params.get("duration"),
+                )
+            except RuntimeError as primary_exc:
+                log.warning("generate_video task polling path failed, falling back to web ability: %s", primary_exc)
+                result = {
+                    "videos": [],
+                    "prompt": params["prompt"],
+                    "message": str(primary_exc),
+                }
             if not result.get("videos"):
                 fallback = await client.generate_video_web(
                     prompt=params["prompt"],
