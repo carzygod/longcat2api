@@ -765,29 +765,58 @@ def create_app(
                     exc.account_id,
                 )
 
-    def _format_video_task(task: Dict[str, Any]) -> Dict[str, Any]:
-        status_map = {
-            "queued": "queued",
-            "in_progress": "running",
-            "running": "running",
-            "completed": "completed",
-            "failed": "failed",
-            "cancelled": "cancelled",
-            "canceled": "cancelled",
-        }
+    def _is_openai_video_request(request: Request) -> bool:
+        path = request.url.path
+        return path == "/v1/videos" or (
+            path.startswith("/v1/videos/")
+            and not path.startswith("/v1/videos/generations")
+        )
+
+    def _openai_video_progress(status: str) -> int:
+        if status in {"completed", "failed", "cancelled"}:
+            return 100
+        if status == "in_progress":
+            return 30
+        return 0
+
+    def _format_video_task(task: Dict[str, Any], *, openai: bool = False) -> Dict[str, Any]:
+        if openai:
+            status_map = {
+                "queued": "queued",
+                "in_progress": "in_progress",
+                "running": "in_progress",
+                "completed": "completed",
+                "failed": "failed",
+                "cancelled": "cancelled",
+                "canceled": "cancelled",
+            }
+        else:
+            status_map = {
+                "queued": "queued",
+                "in_progress": "running",
+                "running": "running",
+                "completed": "completed",
+                "failed": "failed",
+                "cancelled": "cancelled",
+                "canceled": "cancelled",
+            }
         status = status_map.get(str(task["status"]), str(task["status"]))
         response: Dict[str, Any] = {
             "id": task["task_id"],
             "task_id": task["task_id"],
-            "object": "video.generation.task",
+            "object": "video" if openai else "video.generation.task",
             "created": task["created"],
             "updated": task["updated"],
             "status": status,
             "model": task.get("model") or "doubao-video",
             "provider": "DOUBAO-WEB-01",
             "prompt": task["prompt"],
-            "poll_url": f"/v1/video/generations/{task['task_id']}",
+            "poll_url": f"/v1/videos/{task['task_id']}" if openai else f"/v1/video/generations/{task['task_id']}",
         }
+        if openai:
+            response["created_at"] = task["created"]
+            response["completed_at"] = task["updated"]
+            response["progress"] = _openai_video_progress(status)
         if task.get("provider_model"):
             response["provider_model"] = task["provider_model"]
         if task.get("account_id"):
@@ -796,6 +825,10 @@ def create_app(
             response["ratio"] = task["ratio"]
         if task.get("duration"):
             response["duration"] = task["duration"]
+            if openai:
+                response["seconds"] = str(task["duration"])
+        if openai and task.get("ratio"):
+            response["size"] = str(task["ratio"])
         if task.get("message") and not (status == "completed" and task.get("result_json")):
             response["message"] = task["message"]
         if task.get("error"):
@@ -823,6 +856,8 @@ def create_app(
                     first_url = data[0].get("video_url") or data[0].get("url")
                     if first_url:
                         response["url"] = first_url
+                        if openai:
+                            response["metadata"] = {"url": first_url}
         return response
 
     async def _run_video_task(task_id: str, params: Dict[str, Any]) -> None:
@@ -1609,7 +1644,7 @@ def create_app(
             accounts.release_quota(params["quota_reservation_id"])
             raise
         asyncio.create_task(_run_video_task(task_id, params))
-        return JSONResponse(_format_video_task(task))
+        return JSONResponse(_format_video_task(task, openai=_is_openai_video_request(request)))
 
     @app.get("/v1/videos/{task_id}")
     @app.get("/v1/videos/generations/{task_id}")
@@ -1619,7 +1654,7 @@ def create_app(
         task = video_tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Video task not found")
-        return JSONResponse(_format_video_task(task))
+        return JSONResponse(_format_video_task(task, openai=_is_openai_video_request(request)))
 
     @app.post("/v1/videos/{task_id}/cancel")
     @app.post("/v1/videos/generations/{task_id}/cancel")
@@ -1637,7 +1672,7 @@ def create_app(
                 message="Task was cancelled locally.",
             )
             task = video_tasks.get(task_id) or task
-        return JSONResponse(_format_video_task(task))
+        return JSONResponse(_format_video_task(task, openai=_is_openai_video_request(request)))
 
     @app.post("/v1/files")
     async def upload_file(request: Request):
