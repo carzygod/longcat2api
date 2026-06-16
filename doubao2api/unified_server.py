@@ -640,23 +640,22 @@ def create_app(
         try:
             ref_image_key = await _materialize_video_ref_image_key(client, params)
             params["ref_image_key"] = ref_image_key
-            result = await client.generate_video_web(
+            result = await client.generate_video(
                 prompt=params["prompt"],
                 ratio=params.get("ratio"),
                 ref_image_key=ref_image_key,
                 model=params.get("provider_model"),
                 duration=params.get("duration"),
             )
-            if not result.get("videos") and is_video_acceptance_message(str(result.get("message") or "")):
-                log.info("generate_video_web accepted async task without URL; falling back to Samantha task polling")
-                fallback = await client.generate_video(
+            if not result.get("videos"):
+                fallback = await client.generate_video_web(
                     prompt=params["prompt"],
                     ratio=params.get("ratio"),
                     ref_image_key=ref_image_key,
                     model=params.get("provider_model"),
                     duration=params.get("duration"),
                 )
-                if fallback.get("videos"):
+                if fallback.get("videos") or is_video_acceptance_message(str(fallback.get("message") or "")):
                     fallback["message"] = result.get("message") or fallback.get("message", "")
                     result = fallback
         except HTTPException:
