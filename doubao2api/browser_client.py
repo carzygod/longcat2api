@@ -1514,7 +1514,134 @@ class BrowserClient:
 
         full_text = fix_mojibake("".join(text_parts).strip())
         log.info("generate_video_web: got %d videos; text=%s", len(videos), full_text[:120])
+        if not videos and self._is_video_acceptance_text(full_text):
+            ui_result = await self._wait_for_video_result_from_ui(prompt)
+            videos.extend(ui_result.get("videos", []))
         return {"videos": videos, "prompt": prompt, "message": full_text}
+
+    @staticmethod
+    def _is_video_acceptance_text(text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(marker in lowered for marker in (
+            "正在为您生成视频",
+            "视频生成好后",
+            "生成好后",
+            "预计等待",
+            "generating video",
+            "will notify",
+        ))
+
+    async def _wait_for_video_result_from_ui(
+        self,
+        prompt: str,
+        timeout: float = 360,
+    ) -> Dict[str, Any]:
+        """Wait for Doubao's web UI notification card and extract its video URL."""
+        import re
+
+        if not self._page:
+            return {"videos": [], "prompt": prompt}
+
+        prompt_snippet = (prompt or "").strip()[:48]
+        deadline = time.time() + timeout
+        visited: set[str] = set()
+
+        async def extract_current_page() -> List[Dict[str, Any]]:
+            result = await self._page.evaluate(
+                """async () => {
+                    const videoPattern = /mp4|m3u8|douyinvod|mime_type=video_mp4|video_gen/i;
+                    const coverPattern = /video_dsz|video.*watermark|tos-cn-p/i;
+                    const collect = () => {
+                      const urls = new Set();
+                      for (const el of document.querySelectorAll('video, source, a')) {
+                        for (const attr of ['src', 'href', 'currentSrc']) {
+                          const value = el[attr] || (el.getAttribute && el.getAttribute(attr));
+                          if (typeof value === 'string' && videoPattern.test(value)) urls.add(value);
+                        }
+                      }
+                      return Array.from(urls);
+                    };
+                    let urls = collect();
+                    if (!urls.length) {
+                      const covers = Array.from(document.querySelectorAll('img')).filter(img => coverPattern.test(img.src || img.getAttribute('src') || ''));
+                      for (const img of covers.slice(-3)) {
+                        const target = img.closest('button,[role=button],a,div') || img;
+                        try {
+                          target.scrollIntoView({block: 'center', inline: 'center'});
+                          target.click();
+                        } catch (_) {}
+                      }
+                      await new Promise(resolve => setTimeout(resolve, 1800));
+                      urls = collect();
+                    }
+                    return {
+                      href: location.href,
+                      text: document.body ? document.body.innerText : '',
+                      urls,
+                    };
+                }"""
+            )
+            page_text = str(result.get("text") or "")
+            if prompt_snippet and prompt_snippet not in page_text:
+                return []
+            videos: List[Dict[str, Any]] = []
+            for url in result.get("urls") or []:
+                if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                    continue
+                if not re.search(r"(mp4|m3u8|douyinvod|mime_type=video_mp4|video_gen)", url, re.I):
+                    continue
+                videos.append({
+                    "video_url": url,
+                    "cover_url": "",
+                    "width": 0,
+                    "height": 0,
+                    "duration": 0.0,
+                })
+            return videos
+
+        async def candidate_urls() -> List[str]:
+            current = self._page.url
+            links = await self._page.evaluate(
+                """() => Array.from(document.querySelectorAll('a[href*="/chat/"]'))
+                    .map(a => ({ text: (a.innerText || a.textContent || '').trim(), href: a.href }))
+                    .filter(x => /\\/chat\\/\\d+/.test(x.href))
+                    .slice(0, 12)"""
+            )
+            candidates = [current]
+            for item in links or []:
+                text = str(item.get("text") or "")
+                href = str(item.get("href") or "")
+                if not href:
+                    continue
+                if "视频" in text or "生成" in text or "video" in text.lower():
+                    candidates.append(href)
+            unique: List[str] = []
+            for url in candidates:
+                if url and url not in unique:
+                    unique.append(url)
+            return unique
+
+        while time.time() < deadline:
+            try:
+                for url in await candidate_urls():
+                    if url not in visited or time.time() + 20 > deadline:
+                        visited.add(url)
+                    if self._page.url != url:
+                        await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        try:
+                            await self._page.wait_for_load_state("networkidle", timeout=5000)
+                        except Exception:
+                            pass
+                    videos = await extract_current_page()
+                    if videos:
+                        log.info("generate_video_web: collected %d video(s) from UI", len(videos))
+                        return {"videos": videos, "prompt": prompt}
+            except Exception as exc:
+                log.warning("generate_video_web: UI video polling attempt failed: %s", exc)
+            await asyncio.sleep(10)
+
+        log.info("generate_video_web: UI polling timed out without video URL")
+        return {"videos": [], "prompt": prompt}
 
     async def generate_video(
         self,
