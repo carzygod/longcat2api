@@ -229,6 +229,8 @@ class BrowserClient:
             )
             return result == 2
         except Exception as e:
+            if "Execution context was destroyed" in str(e):
+                return True
             log.warning("Browser health check failed: %s", e)
             return False
 
@@ -1622,8 +1624,12 @@ class BrowserClient:
             return unique
 
         while time.time() < deadline:
+            if not self._page:
+                return {"videos": [], "prompt": prompt}
             try:
                 for url in await candidate_urls():
+                    if not self._page:
+                        return {"videos": [], "prompt": prompt}
                     if url not in visited or time.time() + 20 > deadline:
                         visited.add(url)
                     if self._page.url != url:
