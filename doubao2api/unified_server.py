@@ -1541,6 +1541,7 @@ def create_app(
         body = await request.json()
         return await _video_generations_sync(body, request)
 
+    @app.post("/v1/videos")
     @app.post("/v1/videos/generations")
     @app.post("/v1/video/generations")
     async def video_generations(request: Request):
@@ -1582,6 +1583,7 @@ def create_app(
         asyncio.create_task(_run_video_task(task_id, params))
         return JSONResponse(_format_video_task(task))
 
+    @app.get("/v1/videos/{task_id}")
     @app.get("/v1/videos/generations/{task_id}")
     @app.get("/v1/video/generations/{task_id}")
     async def get_video_generation(task_id: str, request: Request):
@@ -1591,6 +1593,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Video task not found")
         return JSONResponse(_format_video_task(task))
 
+    @app.post("/v1/videos/{task_id}/cancel")
     @app.post("/v1/videos/generations/{task_id}/cancel")
     @app.post("/v1/video/generations/{task_id}/cancel")
     async def cancel_video_generation(task_id: str, request: Request):
