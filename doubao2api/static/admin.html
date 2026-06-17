@@ -349,6 +349,7 @@ pre.out{max-height:420px;overflow:auto;white-space:pre-wrap;word-break:break-wor
               <button class="btn" @click="loadCookies(selectedAccount.id)">Cookies</button>
               <button class="btn" @click="syncQuota(selectedAccount.id)" :disabled="probeState.loading">同步额度</button>
               <button class="btn" @click="takeScreenshot(selectedAccount.id)">截图</button>
+              <button class="btn danger" v-if="selectedAccount.id!==defaultAccountId" @click="deleteAccount(selectedAccount.id)">删除账号</button>
             </div>
             <div class="grid" style="gap:0">
               <div class="kv"><span>运行状态</span><strong>{{selectedAccount.runtime?.ready ? '已登录可用' : '未就绪'}}</strong></div>
@@ -614,6 +615,18 @@ createApp({
       await loadAccounts();
       selectedId.value=account.id;
     }
+    async function deleteAccount(id){
+      const account=accounts.value.find(a=>a.id===id);
+      const label=account?`${account.name} / ${account.id}`:id;
+      const ok=window.confirm(`确认删除账号 ${label}？\n\n这会停止该账号浏览器，并删除 SQLite 记录、使用记录、session 文件和浏览器 profile。该操作不可恢复。`);
+      if(!ok)return;
+      await api(`/admin/api/accounts/${encodeURIComponent(id)}`,{method:"DELETE"});
+      if(selectedId.value===id)selectedId.value="";
+      cookieData.account_id="";cookieData.cookies=[];cookieData.total=0;
+      if(screenshot.url)URL.revokeObjectURL(screenshot.url);
+      screenshot.url="";screenshot.time="";
+      await loadAccounts();
+    }
     async function saveQuota(id){
       const account=selectedAccount.value;
       const quotaData={...(account?.quota||{})};
@@ -761,7 +774,7 @@ createApp({
       setInterval(()=>{if(tab.value==="logs")loadLogs()},5000);
       setInterval(()=>{loadAccounts()},15000);
     });
-    return{tabs,tab,title,busy,accounts,selectedId,selectedAccount,defaultAccountId,system,logs,addModal,newAccount,cookieData,screenshot,probeState,qr,showVnc,test,allModels,readyCount,hotCount,novncUrl,quotaForm,refreshAll,loadAccounts,selectAccount,openAdd,createAccount,saveQuota,syncQuota,startAccount,stopAccount,restartAccount,probe,loadCookies,takeScreenshot,startQr,closeQr,runTest,copy,statusText,quota,providerQuota,providerCredit,quotaLimit,quotaRemaining,fmtTime,fmtClock};
+    return{tabs,tab,title,busy,accounts,selectedId,selectedAccount,defaultAccountId,system,logs,addModal,newAccount,cookieData,screenshot,probeState,qr,showVnc,test,allModels,readyCount,hotCount,novncUrl,quotaForm,refreshAll,loadAccounts,selectAccount,openAdd,createAccount,deleteAccount,saveQuota,syncQuota,startAccount,stopAccount,restartAccount,probe,loadCookies,takeScreenshot,startQr,closeQr,runTest,copy,statusText,quota,providerQuota,providerCredit,quotaLimit,quotaRemaining,fmtTime,fmtClock};
   }
 }).mount("#app");
 </script>

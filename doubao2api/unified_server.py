@@ -2383,11 +2383,16 @@ def create_app(
     @app.delete("/admin/api/accounts/{account_id}")
     async def admin_delete_account(account_id: str, request: Request):
         _check_auth(request)
+        if account_id in {"default", accounts.default_account_id}:
+            raise HTTPException(status_code=400, detail="Default account cannot be deleted. Disable or reset it instead.")
         await accounts.stop_client(account_id, update_status=False)
-        deleted = accounts.store.delete_account(account_id)
-        if not deleted:
+        try:
+            result = accounts.store.delete_account(account_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not result.get("deleted"):
             raise HTTPException(status_code=404, detail="Account not found")
-        return JSONResponse({"status": "deleted", "account_id": account_id})
+        return JSONResponse({"status": "deleted", "account_id": account_id, "cleanup": result.get("cleanup", [])})
 
     @app.post("/admin/api/accounts/{account_id}/start")
     async def admin_start_account(account_id: str, request: Request):

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -633,11 +634,49 @@ class DoubaoAccountStore:
             message=text,
         )
 
-    def delete_account(self, account_id: str) -> bool:
+    def delete_account(self, account_id: str) -> Dict[str, Any]:
+        if account_id == "default":
+            raise ValueError("Default account cannot be deleted")
+        account = self.get(account_id)
+        if not account:
+            return {"deleted": False, "account_id": account_id, "cleanup": []}
+
         with self._lock, self._connection() as conn:
             conn.execute("DELETE FROM doubao_account_usage WHERE account_id = ?", (account_id,))
             cur = conn.execute("DELETE FROM doubao_accounts WHERE id = ?", (account_id,))
-            return cur.rowcount > 0
+            deleted = cur.rowcount > 0
+        cleanup = self._cleanup_account_files(account) if deleted else []
+        return {"deleted": deleted, "account_id": account_id, "cleanup": cleanup}
+
+    def _cleanup_account_files(self, account: Dict[str, Any]) -> list[Dict[str, str]]:
+        account_id = str(account.get("id") or "")
+        base_dir = Path(account_data_root()).joinpath("accounts", account_id).expanduser().resolve()
+        results: list[Dict[str, str]] = []
+        candidates = [
+            ("session_file", account.get("session_file")),
+            ("user_data_dir", account.get("user_data_dir")),
+            ("account_dir", str(base_dir)),
+        ]
+        for kind, raw_path in candidates:
+            if not raw_path:
+                continue
+            target = Path(str(raw_path)).expanduser()
+            try:
+                resolved = target.resolve(strict=False)
+                if resolved != base_dir and base_dir not in resolved.parents:
+                    results.append({"kind": kind, "path": str(target), "status": "skipped_outside_account_dir"})
+                    continue
+                if not target.exists() and not target.is_symlink():
+                    results.append({"kind": kind, "path": str(target), "status": "missing"})
+                    continue
+                if target.is_symlink() or target.is_file():
+                    target.unlink()
+                elif target.is_dir():
+                    shutil.rmtree(target)
+                results.append({"kind": kind, "path": str(target), "status": "deleted"})
+            except Exception as exc:
+                results.append({"kind": kind, "path": str(target), "status": "error", "message": str(exc)[:300]})
+        return results
 
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         data = dict(row)

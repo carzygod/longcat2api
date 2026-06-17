@@ -21,6 +21,7 @@ This project does not use official Volcengine/ARK API keys. It drives logged-in 
 | Login | Admin WebUI QR/login flow |
 | Hot accounts | Keeps a configurable number of Playwright accounts warm |
 | Account test | Sends a real upstream chat request and requires model output |
+| Account delete | Stops the account browser and removes SQLite rows, usage records, session file, and browser profile for non-default accounts |
 | Chat API | `/v1/chat/completions` |
 | Image API | `/v1/images/generations` |
 | Music API | `/v1/audio/generations` |
@@ -103,6 +104,7 @@ DOUBAO-WEB-01 是 gen2api 使用的豆包 Web 反代维护版。
 | 登录 | Admin WebUI 扫码 / 登录流程 |
 | 热账号 | 可配置 Playwright 热账号数量 |
 | 账号测试 | 发送真实上游对话请求，拿到模型返回才算成功 |
+| 账号删除 | 非默认账号删除时会停止浏览器，并清理 SQLite 记录、使用记录、session 文件和浏览器 profile |
 | 对话接口 | `/v1/chat/completions` |
 | 生图接口 | `/v1/images/generations` |
 | 音乐接口 | `/v1/audio/generations` |
@@ -185,6 +187,7 @@ DOUBAO-WEB-01 — поддерживаемый Web reverse-proxy для Doubao, 
 | Login | QR/login flow в Admin WebUI |
 | Hot accounts | Настраиваемое число теплых Playwright аккаунтов |
 | Account test | Реальный upstream chat request с проверкой ответа модели |
+| Account delete | Для non-default аккаунтов останавливает браузер и удаляет SQLite rows, usage records, session file и browser profile |
 | Chat API | `/v1/chat/completions` |
 | Image API | `/v1/images/generations` |
 | Music API | `/v1/audio/generations` |
