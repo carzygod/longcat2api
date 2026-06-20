@@ -649,11 +649,11 @@ def create_app(
         accounts.record_task_failure(account["id"], message)
         return retry_next
 
-    async def _materialize_video_image_reference(
+    async def _materialize_video_image_reference_info(
         client: BrowserClient,
         image_value: Any,
         index: int = 0,
-    ) -> Optional[str]:
+    ) -> Optional[Dict[str, Any]]:
         image_value = str(image_value or "").strip()
         if not image_value:
             return None
@@ -679,28 +679,62 @@ def create_app(
                 image_bytes = resp.content
         else:
             # Treat opaque values as an already uploaded upstream image/file key.
-            return image_value
+            return {
+                "uri": image_value,
+                "name": filename,
+                "format": filename.rsplit(".", 1)[-1] if "." in filename else "png",
+                "width": 64,
+                "height": 64,
+            }
 
         uploaded = await client.upload_image(image_bytes=image_bytes, filename=filename)
-        return uploaded.get("uri") or uploaded.get("cdn_url")
+        uri = uploaded.get("uri") or uploaded.get("cdn_url")
+        if not uri:
+            return None
+        uploaded["uri"] = uri
+        uploaded.setdefault("name", filename)
+        uploaded.setdefault("format", filename.rsplit(".", 1)[-1] if "." in filename else "png")
+        uploaded.setdefault("width", 64)
+        uploaded.setdefault("height", 64)
+        return uploaded
+
+    async def _materialize_video_image_reference(
+        client: BrowserClient,
+        image_value: Any,
+        index: int = 0,
+    ) -> Optional[str]:
+        info = await _materialize_video_image_reference_info(client, image_value, index)
+        if not info:
+            return None
+        return str(info.get("uri") or info.get("cdn_url") or "")
+
+    async def _materialize_video_reference_image_infos(
+        client: BrowserClient,
+        params: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        refs = list(params.get("reference_images") or [])
+        if not refs and params.get("ref_image_key"):
+            refs = [params["ref_image_key"]]
+
+        infos: List[Dict[str, Any]] = []
+        seen = set()
+        for index, ref in enumerate(refs):
+            info = await _materialize_video_image_reference_info(client, ref, index)
+            if not info:
+                continue
+            uri = str(info.get("uri") or info.get("cdn_url") or "")
+            if not uri or uri in seen:
+                continue
+            seen.add(uri)
+            info["uri"] = uri
+            infos.append(info)
+        return infos
 
     async def _materialize_video_reference_image_keys(
         client: BrowserClient,
         params: Dict[str, Any],
     ) -> List[str]:
-        refs = list(params.get("reference_images") or [])
-        if not refs and params.get("ref_image_key"):
-            refs = [params["ref_image_key"]]
-
-        keys: List[str] = []
-        seen = set()
-        for index, ref in enumerate(refs):
-            key = await _materialize_video_image_reference(client, ref, index)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            keys.append(str(key))
-        return keys
+        return [str(info["uri"]) for info in await _materialize_video_reference_image_infos(client, params)]
 
     async def _execute_video_generation_once(params: Dict[str, Any], request: Optional[Request] = None) -> Dict[str, Any]:
         await bucket.acquire()
@@ -731,10 +765,12 @@ def create_app(
             params["quota_reservation_id"] = reservation_id
             params["quota_units"] = quota_units
         try:
-            reference_image_keys = await _materialize_video_reference_image_keys(client, params)
+            reference_image_infos = await _materialize_video_reference_image_infos(client, params)
+            reference_image_keys = [str(info["uri"]) for info in reference_image_infos if info.get("uri")]
             ref_image_key = reference_image_keys[0] if reference_image_keys else None
             params["ref_image_key"] = ref_image_key
             params["reference_image_keys"] = reference_image_keys
+            params["reference_image_infos"] = reference_image_infos
             if params.get("task_id"):
                 video_tasks.update(
                     str(params["task_id"]),
@@ -748,6 +784,7 @@ def create_app(
                     ratio=params.get("ratio"),
                     ref_image_key=ref_image_key,
                     reference_image_keys=reference_image_keys,
+                    reference_image_infos=reference_image_infos,
                     model=params.get("provider_model"),
                     duration=params.get("duration"),
                 )
@@ -758,12 +795,14 @@ def create_app(
                     "prompt": params["prompt"],
                     "message": str(primary_exc),
                 }
-            if not result.get("videos"):
+            primary_accepted = is_video_acceptance_message(str(result.get("message") or ""))
+            if not result.get("videos") and not primary_accepted:
                 fallback = await client.generate_video_web(
                     prompt=params["prompt"],
                     ratio=params.get("ratio"),
                     ref_image_key=ref_image_key,
                     reference_image_keys=reference_image_keys,
+                    reference_image_infos=reference_image_infos,
                     model=params.get("provider_model"),
                     duration=params.get("duration"),
                 )
@@ -787,6 +826,26 @@ def create_app(
         msg = result.get("message", "")
         if not videos:
             message = msg or "No videos generated"
+            if is_video_acceptance_message(message):
+                accounts.complete_quota(reservation_id)
+                accounts.update_provider_quota_from_text(
+                    account["id"],
+                    "video",
+                    message,
+                    units_completed=quota_units,
+                )
+                accounts.mark_success(account["id"])
+                refreshed_account = accounts.store.get(account["id"]) or account
+                return {
+                    "created": int(time.time()),
+                    "data": [],
+                    "account_id": account["id"],
+                    "quota": accounts.store.quota_snapshot(refreshed_account, "video"),
+                    "message": message,
+                    "pending": True,
+                    "accepted": True,
+                    "reference_image_keys": params.get("reference_image_keys") or [],
+                }
             retry_next = await _handle_video_attempt_failure(account, client, reservation_id, message, quota_units)
             raise _VideoAttemptFailed(account["id"], message, retry_next)
         accounts.complete_quota(reservation_id)
@@ -1025,6 +1084,15 @@ def create_app(
         message = result.get("message", "")
         current = video_tasks.get(task_id)
         if current and current.get("status") == "cancelled":
+            return
+        if result.get("pending"):
+            video_tasks.update(
+                task_id,
+                "in_progress",
+                result_json=json.dumps(result, ensure_ascii=False),
+                message=message,
+                account_id=result.get("account_id"),
+            )
             return
         video_tasks.update(
             task_id,

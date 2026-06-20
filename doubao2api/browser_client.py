@@ -600,6 +600,7 @@ class BrowserClient:
         bot_id: Optional[str] = None,
         use_deep_think: int = 0,
         chat_ability: Optional[Dict[str, Any]] = None,
+        image_attachments: Optional[List[Dict[str, Any]]] = None,
         stream_timeout: float = 180,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Send a chat message and yield SSE events via in-browser fetch."""
@@ -624,17 +625,10 @@ class BrowserClient:
             },
             "messages": [{
                 "local_message_id": msg_uuid,
-                "content_block": [{
-                    "block_type": 10000,
-                    "content": {
-                        "text_block": {"text": text, "icon_url": "", "icon_url_dark": "", "summary": ""},
-                        "pc_event_block": "",
-                    },
-                    "block_id": str(uuid.uuid4()),
-                    "parent_id": "",
-                    "meta_info": [],
-                    "append_fields": [],
-                }],
+                "content_block": self._build_chat_content_blocks(
+                    text,
+                    image_attachments=image_attachments,
+                ),
                 "message_status": 0,
             }],
             "option": {
@@ -744,6 +738,105 @@ class BrowserClient:
                     eval_task.result()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _safe_int(value: Any, default: int) -> int:
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError):
+            return default
+        return number if number > 0 else default
+
+    @staticmethod
+    def _build_chat_content_blocks(
+        text: str,
+        image_attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Build Doubao chat content blocks with visible image attachments.
+
+        Doubao's current web UI persists images as BLOCK_ATTACHMENT entries.
+        Passing only Samantha ``attachments`` or only a hidden ``ref_image_key``
+        can make the downstream video skill receive a text-only message.
+        """
+        blocks: List[Dict[str, Any]] = []
+        attachments: List[Dict[str, Any]] = []
+        for image in image_attachments or []:
+            uri = str(
+                image.get("uri")
+                or image.get("key")
+                or image.get("fileKey")
+                or image.get("file_key")
+                or ""
+            ).strip()
+            if not uri:
+                continue
+            name = str(image.get("name") or image.get("fileName") or "image.png")
+            fmt = str(image.get("format") or (name.rsplit(".", 1)[-1] if "." in name else "png"))
+            cdn_url = str(
+                image.get("cdn_url")
+                or image.get("url")
+                or image.get("main_url")
+                or ""
+            )
+            width = BrowserClient._safe_int(image.get("width"), 64)
+            height = BrowserClient._safe_int(image.get("height"), 64)
+            attachments.append({
+                "type": 2,
+                "identifier": str(image.get("identifier") or uuid.uuid4()),
+                "image": {
+                    "name": name,
+                    "uri": uri,
+                    "key": uri,
+                    "image_ori": {
+                        "url": cdn_url,
+                        "width": width,
+                        "height": height,
+                        "format": fmt,
+                        "url_formats": {},
+                    },
+                },
+                "parse_state": BrowserClient._safe_int(image.get("parse_state"), 0),
+                "review_state": BrowserClient._safe_int(image.get("review_state"), 0),
+                "upload_status": 1,
+                "progress": 100,
+                "src": cdn_url,
+                "extra": {"refer_types": "overall"},
+            })
+
+        if attachments:
+            blocks.append({
+                "block_type": 10052,
+                "content": {
+                    "attachment_block": {"attachments": attachments},
+                    "pc_event_block": "",
+                },
+                "block_id": str(uuid.uuid4()),
+                "parent_id": "",
+                "meta_info": [],
+                "append_fields": [],
+                "is_finish": True,
+                "patch_type": 2,
+            })
+
+        blocks.append({
+            "block_type": 10000,
+            "content": {
+                "text_block": {
+                    "text": text,
+                    "icon_url": "",
+                    "icon_url_dark": "",
+                    "summary": "",
+                },
+                "pc_event_block": "",
+            },
+            "block_id": str(uuid.uuid4()),
+            "parent_id": "",
+            "meta_info": [],
+            "append_fields": [],
+            "is_finish": True,
+            "patch_type": 2,
+        })
+        return blocks
 
     async def _browser_fetch_stream(
         self, url: str, payload: Dict[str, Any], request_id: str
@@ -1117,6 +1210,29 @@ class BrowserClient:
                 continue
         return events
 
+    @staticmethod
+    def _find_samantha_conversation_id(value: Any) -> str:
+        """Find a conversation_id anywhere in a Samantha SSE event payload."""
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return ""
+        if isinstance(value, dict):
+            candidate = value.get("conversation_id")
+            if candidate and str(candidate) != "0":
+                return str(candidate)
+            for item in value.values():
+                found = BrowserClient._find_samantha_conversation_id(item)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = BrowserClient._find_samantha_conversation_id(item)
+                if found:
+                    return found
+        return ""
+
     async def generate_image(
         self,
         prompt: str,
@@ -1412,12 +1528,52 @@ class BrowserClient:
         return result
 
     @staticmethod
+    def _normalize_reference_image_attachments(
+        ref_image_key: Optional[str],
+        reference_image_keys: Optional[List[str]],
+        reference_image_infos: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Normalize uploaded image metadata for visible chat attachments."""
+        attachments: List[Dict[str, Any]] = []
+        seen = set()
+        for info in reference_image_infos or []:
+            if not isinstance(info, dict):
+                continue
+            uri = str(
+                info.get("uri")
+                or info.get("key")
+                or info.get("fileKey")
+                or info.get("file_key")
+                or ""
+            ).strip()
+            if not uri or uri in seen:
+                continue
+            seen.add(uri)
+            attachment = dict(info)
+            attachment["uri"] = uri
+            attachments.append(attachment)
+
+        for key in BrowserClient._normalize_reference_image_keys(ref_image_key, reference_image_keys):
+            if key in seen:
+                continue
+            seen.add(key)
+            attachments.append({
+                "uri": key,
+                "name": "reference.png",
+                "format": "png",
+                "width": 64,
+                "height": 64,
+            })
+        return attachments
+
+    @staticmethod
     def _build_video_message(
         prompt: str,
         ratio: Optional[str],
         image_keys: List[str],
         model: Optional[str],
         duration: Optional[int],
+        image_attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         content_data: Dict[str, Any] = {"text": prompt}
         if ratio:
@@ -1427,6 +1583,33 @@ class BrowserClient:
             content_data["ref_image_keys"] = image_keys
             content_data["reference_image_keys"] = image_keys
             content_data["reference_images"] = [{"key": key, "type": "image"} for key in image_keys]
+            ref_images: List[Dict[str, Any]] = []
+            by_uri: Dict[str, Dict[str, Any]] = {}
+            for item in image_attachments or []:
+                uri = str(item.get("uri") or item.get("key") or "").strip()
+                if uri:
+                    by_uri[uri] = item
+            for key in image_keys:
+                info = by_uri.get(key, {})
+                ref_images.append({
+                    "image_token": key,
+                    "url": info.get("cdn_url") or info.get("url") or info.get("main_url") or "",
+                    "refer_types": "overall",
+                    "review_status": BrowserClient._safe_int(info.get("review_status"), 1),
+                    "identifier": str(info.get("identifier") or uuid.uuid4()),
+                    "file_name": info.get("name") or "reference.png",
+                    "image_ori": {
+                        "url": info.get("cdn_url") or info.get("url") or info.get("main_url") or "",
+                        "width": BrowserClient._safe_int(info.get("width"), 64),
+                        "height": BrowserClient._safe_int(info.get("height"), 64),
+                        "format": info.get("format") or "png",
+                    },
+                })
+            content_data["samantha_context"] = {
+                "query_context": {
+                    "ref_images": ref_images,
+                }
+            }
         if model:
             content_data["model"] = model
         if duration:
@@ -1446,7 +1629,13 @@ class BrowserClient:
         }
         if image_keys:
             message["attachments"] = [
-                {"type": "image", "key": key, "extra": {"refer_types": "overall"}}
+                {
+                    "type": "image",
+                    "key": key,
+                    "url": (by_uri.get(key, {}).get("cdn_url") or by_uri.get(key, {}).get("url") or ""),
+                    "extra": {"refer_types": "overall"},
+                    "identifier": str(by_uri.get(key, {}).get("identifier") or uuid.uuid4()),
+                }
                 for key in image_keys
             ]
         return message
@@ -1457,6 +1646,7 @@ class BrowserClient:
         ratio: Optional[str] = None,
         ref_image_key: Optional[str] = None,
         reference_image_keys: Optional[List[str]] = None,
+        reference_image_infos: Optional[List[Dict[str, Any]]] = None,
         model: Optional[str] = None,
         duration: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -1464,7 +1654,12 @@ class BrowserClient:
         import base64
         import re
 
-        image_keys = self._normalize_reference_image_keys(ref_image_key, reference_image_keys)
+        image_attachments = self._normalize_reference_image_attachments(
+            ref_image_key,
+            reference_image_keys,
+            reference_image_infos,
+        )
+        image_keys = [str(item["uri"]) for item in image_attachments if item.get("uri")]
 
         ability_param: Dict[str, Any] = {
             "model": model or os.environ.get("DOUBAO_VIDEO_MODEL", "seedance_v2.0"),
@@ -1570,6 +1765,7 @@ class BrowserClient:
             text_prompt,
             use_deep_think=0,
             chat_ability=chat_ability,
+            image_attachments=image_attachments,
             stream_timeout=float(os.environ.get("DOUBAO_VIDEO_TIMEOUT", "420")),
         ):
             if event.get("error"):
@@ -1602,6 +1798,7 @@ class BrowserClient:
     async def _wait_for_video_result_from_ui(
         self,
         prompt: str,
+        conversation_id: Optional[str] = None,
         timeout: float = 360,
     ) -> Dict[str, Any]:
         """Wait for Doubao's web UI notification card and extract its video URL."""
@@ -1611,6 +1808,7 @@ class BrowserClient:
             return {"videos": [], "prompt": prompt}
 
         prompt_snippet = (prompt or "").strip()[:48]
+        require_prompt_match = not conversation_id
         deadline = time.time() + timeout
         visited: set[str] = set()
 
@@ -1650,7 +1848,7 @@ class BrowserClient:
                 }"""
             )
             page_text = str(result.get("text") or "")
-            if prompt_snippet and prompt_snippet not in page_text:
+            if require_prompt_match and prompt_snippet and prompt_snippet not in page_text:
                 return []
             videos: List[Dict[str, Any]] = []
             for url in result.get("urls") or []:
@@ -1675,7 +1873,10 @@ class BrowserClient:
                     .filter(x => /\\/chat\\/\\d+/.test(x.href))
                     .slice(0, 12)"""
             )
-            candidates = [current]
+            candidates = []
+            if conversation_id:
+                candidates.append(f"{DOUBAO_URL}/chat/{conversation_id}")
+            candidates.append(current)
             for item in links or []:
                 text = str(item.get("text") or "")
                 href = str(item.get("href") or "")
@@ -1721,6 +1922,7 @@ class BrowserClient:
         ratio: Optional[str] = None,
         ref_image_key: Optional[str] = None,
         reference_image_keys: Optional[List[str]] = None,
+        reference_image_infos: Optional[List[Dict[str, Any]]] = None,
         model: Optional[str] = None,
         duration: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -1737,9 +1939,21 @@ class BrowserClient:
         """
         import base64
 
-        image_keys = self._normalize_reference_image_keys(ref_image_key, reference_image_keys)
+        image_attachments = self._normalize_reference_image_attachments(
+            ref_image_key,
+            reference_image_keys,
+            reference_image_infos,
+        )
+        image_keys = [str(item["uri"]) for item in image_attachments if item.get("uri")]
 
-        message = self._build_video_message(prompt, ratio, image_keys, model, duration)
+        message = self._build_video_message(
+            prompt,
+            ratio,
+            image_keys,
+            model,
+            duration,
+            image_attachments=image_attachments,
+        )
 
         payload = {
             "messages": [message],
@@ -1769,8 +1983,11 @@ class BrowserClient:
 
         # Phase 1: Extract async task_id from fin_reason
         task_id = None
+        conversation_id = ""
         text_parts = []
         for data in self._parse_samantha_sse(raw):
+            if not conversation_id:
+                conversation_id = self._find_samantha_conversation_id(data)
             et = data.get("event_type")
             if et == 2005:
                 detail = data.get("event_data", "")
@@ -1814,6 +2031,18 @@ class BrowserClient:
         if not task_id:
             # Maybe sync result with content_type=2021, or just text response
             if full_text:
+                if self._is_video_acceptance_text(full_text):
+                    if conversation_id:
+                        log.info("generate_video: accepted without task_id; waiting on conversation_id=%s", conversation_id)
+                    ui_result = await self._wait_for_video_result_from_ui(
+                        prompt,
+                        conversation_id=conversation_id or None,
+                    )
+                    return {
+                        "videos": ui_result.get("videos", []),
+                        "prompt": prompt,
+                        "message": full_text,
+                    }
                 return {"videos": [], "prompt": prompt, "message": full_text}
             raise RuntimeError("Video generation: no task_id returned")
 
