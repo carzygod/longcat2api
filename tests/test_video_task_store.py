@@ -42,12 +42,16 @@ class VideoTaskStoreTest(unittest.TestCase):
                 "completed",
                 result_json=json.dumps(result),
                 account_id="second-account",
+                ref_image_key="tos-final-a",
+                reference_image_keys=json.dumps(["tos-final-a", "tos-final-b"]),
             )
             task = store.get("video-test")
 
             self.assertIsNotNone(task)
             self.assertEqual(task["status"], "completed")
             self.assertEqual(task["account_id"], "second-account")
+            self.assertEqual(task["ref_image_key"], "tos-final-a")
+            self.assertEqual(json.loads(task["reference_image_keys"]), ["tos-final-a", "tos-final-b"])
             self.assertEqual(json.loads(task["result_json"]), result)
 
     def test_mark_interrupted_tasks_failed(self):

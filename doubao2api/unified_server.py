@@ -735,6 +735,13 @@ def create_app(
             ref_image_key = reference_image_keys[0] if reference_image_keys else None
             params["ref_image_key"] = ref_image_key
             params["reference_image_keys"] = reference_image_keys
+            if params.get("task_id"):
+                video_tasks.update(
+                    str(params["task_id"]),
+                    "in_progress",
+                    ref_image_key=ref_image_key,
+                    reference_image_keys=json.dumps(reference_image_keys, ensure_ascii=False),
+                )
             try:
                 result = await client.generate_video(
                     prompt=params["prompt"],
@@ -1761,6 +1768,7 @@ def create_app(
         )
         params["account_id"] = account["id"]
         task_id = f"video-{uuid.uuid4().hex}"
+        params["task_id"] = task_id
         params["quota_units"] = quota_units
         params["quota_reservation_id"] = accounts.reserve_quota(
             account["id"],
@@ -1826,6 +1834,7 @@ def create_app(
         )
         params["account_id"] = account["id"]
         task_id = f"video-{uuid.uuid4().hex}"
+        params["task_id"] = task_id
         params["quota_units"] = quota_units
         params["quota_reservation_id"] = accounts.reserve_quota(
             account["id"],
