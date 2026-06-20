@@ -88,20 +88,64 @@ class VideoTaskStore:
             if "reference_image_keys" not in cols:
                 conn.execute("ALTER TABLE video_tasks ADD COLUMN reference_image_keys TEXT")
 
+    @staticmethod
+    def _is_accepted_pending_result(result_json: Any, message: Any = "") -> bool:
+        if result_json:
+            try:
+                result = json.loads(result_json)
+            except (TypeError, json.JSONDecodeError):
+                result = None
+            if isinstance(result, dict) and (result.get("pending") or result.get("accepted")):
+                return True
+        text = str(message or "").lower()
+        accepted_markers = (
+            "generating video",
+            "will notify",
+            "\u9884\u8ba1\u7b49\u5f85",
+            "\u751f\u6210\u597d\u540e",
+            "\u6b63\u5728\u4e3a\u4f60\u751f\u6210",
+            "\u6b63\u5728\u4e3a\u60a8\u751f\u6210",
+        )
+        return any(marker.lower() in text for marker in accepted_markers)
+
     def mark_interrupted(self) -> None:
         now = int(time.time())
         with self._lock, self._connection() as conn:
-            conn.execute(
+            rows = conn.execute(
                 """
-                UPDATE video_tasks
-                   SET status = 'failed',
-                       updated = ?,
-                       error = COALESCE(error, 'server restarted before task completed'),
-                       message = COALESCE(message, 'server restarted before task completed')
+                SELECT task_id, status, result_json, message
+                  FROM video_tasks
                  WHERE status IN ('queued', 'in_progress')
-                """,
-                (now,),
-            )
+                """
+            ).fetchall()
+            for row in rows:
+                task_id = row["task_id"]
+                keep_pending = self._is_accepted_pending_result(
+                    row["result_json"],
+                    row["message"],
+                )
+                if keep_pending:
+                    conn.execute(
+                        """
+                        UPDATE video_tasks
+                           SET status = 'in_progress',
+                               updated = ?
+                         WHERE task_id = ?
+                        """,
+                        (now, task_id),
+                    )
+                    continue
+                conn.execute(
+                    """
+                    UPDATE video_tasks
+                       SET status = 'failed',
+                           updated = ?,
+                           error = COALESCE(error, 'server restarted before task completed'),
+                           message = COALESCE(message, 'server restarted before task completed')
+                     WHERE task_id = ?
+                    """,
+                    (now, task_id),
+                )
 
     def cleanup(self, max_age_seconds: int = 7 * 24 * 3600) -> None:
         cutoff = int(time.time()) - max_age_seconds

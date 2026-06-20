@@ -71,6 +71,63 @@ class VideoTaskStoreTest(unittest.TestCase):
             self.assertEqual(task["status"], "failed")
             self.assertIn("server restarted", task["error"])
 
+    def test_mark_interrupted_preserves_accepted_pending_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "video_tasks.sqlite3"
+            store = VideoTaskStore(str(db_path))
+            store.create(
+                "video-accepted-pending",
+                {"prompt": "red square", "model": "doubao-video"},
+                {"prompt": "red square"},
+            )
+            pending_result = {
+                "data": [],
+                "pending": True,
+                "accepted": True,
+                "message": "video generation accepted",
+            }
+            store.update(
+                "video-accepted-pending",
+                "in_progress",
+                result_json=json.dumps(pending_result),
+                message="video generation accepted",
+            )
+
+            store.mark_interrupted()
+            task = store.get("video-accepted-pending")
+
+            self.assertIsNotNone(task)
+            self.assertEqual(task["status"], "in_progress")
+            self.assertIsNone(task["error"])
+            self.assertEqual(task["message"], "video generation accepted")
+            self.assertEqual(json.loads(task["result_json"]), pending_result)
+
+    def test_mark_interrupted_preserves_task_with_accepted_message_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "video_tasks.sqlite3"
+            store = VideoTaskStore(str(db_path))
+            store.create(
+                "video-message-pending",
+                {"prompt": "red square", "model": "doubao-video"},
+                {"prompt": "red square"},
+            )
+            store.update(
+                "video-message-pending",
+                "in_progress",
+                message="The service is generating video and will notify when ready.",
+            )
+
+            store.mark_interrupted()
+            task = store.get("video-message-pending")
+
+            self.assertIsNotNone(task)
+            self.assertEqual(task["status"], "in_progress")
+            self.assertIsNone(task["error"])
+            self.assertEqual(
+                task["message"],
+                "The service is generating video and will notify when ready.",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
