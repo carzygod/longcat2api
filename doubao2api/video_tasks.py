@@ -225,14 +225,65 @@ class VideoTaskStore:
 
     def normalize_completed(self) -> None:
         with self._lock, self._connection() as conn:
-            conn.execute(
+            rows = conn.execute(
                 """
-                UPDATE video_tasks
-                   SET error = NULL
+                SELECT task_id, result_json, message, error
+                  FROM video_tasks
                  WHERE status = 'completed'
-                   AND result_json IS NOT NULL
                 """
-            )
+            ).fetchall()
+            now = int(time.time())
+            for row in rows:
+                if self._completed_result_has_video_url(row["result_json"]):
+                    conn.execute(
+                        """
+                        UPDATE video_tasks
+                           SET error = NULL
+                         WHERE task_id = ?
+                        """,
+                        (row["task_id"],),
+                    )
+                    continue
+                message = (
+                    row["error"]
+                    or row["message"]
+                    or "Completed video task did not contain a retrievable video URL"
+                )
+                conn.execute(
+                    """
+                    UPDATE video_tasks
+                       SET status = 'failed',
+                           updated = ?,
+                           error = ?,
+                           message = COALESCE(message, ?)
+                     WHERE task_id = ?
+                    """,
+                    (now, message, message, row["task_id"]),
+                )
+
+    @staticmethod
+    def _completed_result_has_video_url(result_json: Any) -> bool:
+        if isinstance(result_json, str) and result_json.strip():
+            try:
+                result_json = json.loads(result_json)
+            except json.JSONDecodeError:
+                result_json = {}
+        if not isinstance(result_json, dict):
+            return False
+        for key in ("data", "output"):
+            data = result_json.get(key)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and (item.get("video_url") or item.get("url")):
+                        return True
+        result = result_json.get("result")
+        if isinstance(result, dict):
+            data = result.get("data")
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and (item.get("video_url") or item.get("url")):
+                        return True
+        return bool(result_json.get("url") or result_json.get("video_url"))
 
     def cleanup(self, max_age_seconds: int = 7 * 24 * 3600) -> None:
         cutoff = int(time.time()) - max_age_seconds

@@ -221,6 +221,30 @@ class VideoTaskStoreTest(unittest.TestCase):
             self.assertEqual(task["status"], "completed")
             self.assertIsNone(task["error"])
 
+    def test_normalize_completed_marks_missing_video_url_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "video_tasks.sqlite3"
+            store = VideoTaskStore(str(db_path))
+            store.create(
+                "video-false-completed",
+                {"prompt": "red square", "model": "doubao-video"},
+                {"prompt": "red square"},
+            )
+            message = "Provider accepted the video request but did not expose a retrievable task_id or conversation_id."
+            store.update(
+                "video-false-completed",
+                "completed",
+                result_json=json.dumps({"data": [], "message": message}),
+                message=message,
+            )
+
+            store.normalize_completed()
+            task = store.get("video-false-completed")
+
+            self.assertIsNotNone(task)
+            self.assertEqual(task["status"], "failed")
+            self.assertEqual(task["error"], message)
+
 
 if __name__ == "__main__":
     unittest.main()
