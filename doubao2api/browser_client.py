@@ -1790,6 +1790,7 @@ class BrowserClient:
             return text
 
         log.info("generate_video_web: prompt=%s, ability=%s", prompt[:50], ability_param)
+        conversation_id = ""
         async for event in self.chat_completion(
             text_prompt,
             use_deep_think=0,
@@ -1803,6 +1804,10 @@ class BrowserClient:
                 raise RuntimeError(
                     f"API error {event.get('status')}: {event.get('body', '')[:500]}"
                 )
+            if not conversation_id:
+                cid = self.extract_conversation_id(event)
+                if cid and cid != "0":
+                    conversation_id = cid
             if isinstance(event.get("text"), str):
                 text_parts.append(event["text"])
             walk(event)
@@ -1810,9 +1815,18 @@ class BrowserClient:
         full_text = fix_mojibake("".join(text_parts).strip())
         log.info("generate_video_web: got %d videos; text=%s", len(videos), full_text[:120])
         if not videos and self._is_video_acceptance_text(full_text):
-            ui_result = await self._wait_for_video_result_from_ui(prompt)
+            ui_result = await self._wait_for_video_result_from_ui(
+                prompt,
+                conversation_id=conversation_id or None,
+            )
             videos.extend(ui_result.get("videos", []))
-        return {"videos": videos, "prompt": prompt, "message": full_text}
+            conversation_id = conversation_id or str(ui_result.get("conversation_id") or "")
+        return {
+            "videos": videos,
+            "prompt": prompt,
+            "message": full_text,
+            "conversation_id": conversation_id,
+        }
 
     @staticmethod
     def _is_video_acceptance_text(text: str) -> bool:
@@ -1836,8 +1850,9 @@ class BrowserClient:
         import re
 
         if not self._page:
-            return {"videos": [], "prompt": prompt}
+            return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
 
+        video_regex = re.compile(r"(mp4|m3u8|douyinvod|mime_type=video_mp4|video_gen)", re.I)
         prompt_snippet = (prompt or "").strip()[:48]
         require_prompt_match = not conversation_id
         deadline = time.time() + timeout
@@ -1847,21 +1862,27 @@ class BrowserClient:
             result = await self._page.evaluate(
                 """async () => {
                     const videoPattern = /mp4|m3u8|douyinvod|mime_type=video_mp4|video_gen/i;
-                    const coverPattern = /video_dsz|video.*watermark|tos-cn-p/i;
+                    const coverPattern = /video_dsz|video.*watermark|tos-cn-p|douyinvod/i;
                     const collect = () => {
                       const urls = new Set();
-                      for (const el of document.querySelectorAll('video, source, a')) {
+                      for (const el of document.querySelectorAll('video, source, a, [src], [href]')) {
                         for (const attr of ['src', 'href', 'currentSrc']) {
                           const value = el[attr] || (el.getAttribute && el.getAttribute(attr));
                           if (typeof value === 'string' && videoPattern.test(value)) urls.add(value);
                         }
                       }
+                      const html = document.body ? document.body.innerHTML : '';
+                      for (const match of html.matchAll(/https?:\\/\\/[^\\s'"<>]+/g)) {
+                        if (videoPattern.test(match[0])) urls.add(match[0]);
+                      }
                       return Array.from(urls);
                     };
+                    try { window.scrollTo(0, document.body ? document.body.scrollHeight : 0); } catch (_) {}
+                    await new Promise(resolve => setTimeout(resolve, 600));
                     let urls = collect();
                     if (!urls.length) {
                       const covers = Array.from(document.querySelectorAll('img')).filter(img => coverPattern.test(img.src || img.getAttribute('src') || ''));
-                      for (const img of covers.slice(-3)) {
+                      for (const img of covers.slice(-5)) {
                         const target = img.closest('button,[role=button],a,div') || img;
                         try {
                           target.scrollIntoView({block: 'center', inline: 'center'});
@@ -1885,7 +1906,9 @@ class BrowserClient:
             for url in result.get("urls") or []:
                 if not isinstance(url, str) or not url.startswith(("http://", "https://")):
                     continue
-                if not re.search(r"(mp4|m3u8|douyinvod|mime_type=video_mp4|video_gen)", url, re.I):
+                if not video_regex.search(url):
+                    continue
+                if any(video["video_url"] == url for video in videos):
                     continue
                 videos.append({
                     "video_url": url,
@@ -1902,7 +1925,7 @@ class BrowserClient:
                 """() => Array.from(document.querySelectorAll('a[href*="/chat/"]'))
                     .map(a => ({ text: (a.innerText || a.textContent || '').trim(), href: a.href }))
                     .filter(x => /\\/chat\\/\\d+/.test(x.href))
-                    .slice(0, 12)"""
+                    .slice(0, 30)"""
             )
             candidates = []
             if conversation_id:
@@ -1915,6 +1938,10 @@ class BrowserClient:
                     continue
                 if "视频" in text or "生成" in text or "video" in text.lower():
                     candidates.append(href)
+            for item in links or []:
+                href = str(item.get("href") or "")
+                if href:
+                    candidates.append(href)
             unique: List[str] = []
             for url in candidates:
                 if url and url not in unique:
@@ -1923,11 +1950,11 @@ class BrowserClient:
 
         while time.time() < deadline:
             if not self._page:
-                return {"videos": [], "prompt": prompt}
+                return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
             try:
                 for url in await candidate_urls():
                     if not self._page:
-                        return {"videos": [], "prompt": prompt}
+                        return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
                     if url not in visited or time.time() + 20 > deadline:
                         visited.add(url)
                     if self._page.url != url:
@@ -1939,13 +1966,26 @@ class BrowserClient:
                     videos = await extract_current_page()
                     if videos:
                         log.info("generate_video_web: collected %d video(s) from UI", len(videos))
-                        return {"videos": videos, "prompt": prompt}
+                        return {"videos": videos, "prompt": prompt, "conversation_id": conversation_id}
             except Exception as exc:
                 log.warning("generate_video_web: UI video polling attempt failed: %s", exc)
             await asyncio.sleep(10)
 
         log.info("generate_video_web: UI polling timed out without video URL")
-        return {"videos": [], "prompt": prompt}
+        return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
+
+    async def recover_video_result(
+        self,
+        prompt: str,
+        conversation_id: Optional[str] = None,
+        timeout: float = 30,
+    ) -> Dict[str, Any]:
+        """Recover an already accepted video from a Doubao conversation."""
+        return await self._wait_for_video_result_from_ui(
+            prompt,
+            conversation_id=conversation_id,
+            timeout=timeout,
+        )
 
     async def generate_video(
         self,
@@ -1986,6 +2026,7 @@ class BrowserClient:
             image_attachments=image_attachments,
         )
 
+        local_conversation_id = str(uuid.uuid4())
         payload = {
             "messages": [message],
             "completion_option": {
@@ -2005,7 +2046,7 @@ class BrowserClient:
                 "action_bar_skill_id": 17,
             },
             "evaluate_option": {"web_ab_params": ""},
-            "local_conversation_id": str(uuid.uuid4()),
+            "local_conversation_id": local_conversation_id,
             "local_message_id": str(uuid.uuid4()),
         }
 
@@ -2073,13 +2114,32 @@ class BrowserClient:
                         "videos": ui_result.get("videos", []),
                         "prompt": prompt,
                         "message": full_text,
+                        "conversation_id": conversation_id,
+                        "local_conversation_id": local_conversation_id,
+                        "pending": not bool(ui_result.get("videos")),
+                        "accepted": True,
                     }
-                return {"videos": [], "prompt": prompt, "message": full_text}
+                return {
+                    "videos": [],
+                    "prompt": prompt,
+                    "message": full_text,
+                    "conversation_id": conversation_id,
+                    "local_conversation_id": local_conversation_id,
+                }
             raise RuntimeError("Video generation: no task_id returned")
 
         # Phase 2: Poll for result
         log.info("generate_video: polling task_id=%s", task_id)
-        return await self._poll_video_result(task_id, prompt)
+        result = await self._poll_video_result(task_id, prompt)
+        if full_text and not result.get("message"):
+            result["message"] = full_text
+        result.setdefault("provider_task_id", task_id)
+        result.setdefault("conversation_id", conversation_id)
+        result.setdefault("local_conversation_id", local_conversation_id)
+        if not result.get("videos"):
+            result.setdefault("pending", True)
+            result.setdefault("accepted", True)
+        return result
 
     async def _poll_video_result(
         self, task_id: str, prompt: str, timeout: float = 300

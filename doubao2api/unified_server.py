@@ -347,6 +347,7 @@ def create_app(
 
         # Start browser watchdog
         watchdog_task = asyncio.create_task(_browser_watchdog())
+        recovery_task = asyncio.create_task(_video_recovery_worker())
 
         # Start Qianwen client (optional, enabled via env var)
         qw_client = None
@@ -369,6 +370,7 @@ def create_app(
 
         # Shutdown
         watchdog_task.cancel()
+        recovery_task.cancel()
         await accounts.stop_all()
         qw = _qianwen.pop("client", None)
         if qw:
@@ -401,7 +403,30 @@ def create_app(
     bucket = _TokenBucket(rpm_limit)
     video_tasks = VideoTaskStore(video_task_db_path())
     video_tasks.mark_interrupted()
+    video_tasks.normalize_completed()
     video_tasks.cleanup()
+    _video_recovery_locks: Dict[str, asyncio.Lock] = {}
+
+    def _video_lock(task_id: str) -> asyncio.Lock:
+        lock = _video_recovery_locks.get(task_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _video_recovery_locks[task_id] = lock
+        return lock
+
+    def _accepted_video_result(result: Dict[str, Any]) -> bool:
+        if result.get("accepted") or result.get("pending") or result.get("provider_task_id"):
+            return True
+        return is_video_acceptance_message(str(result.get("message") or ""))
+
+    def _video_task_update_fields(result: Dict[str, Any], *, accepted: bool = False) -> Dict[str, Any]:
+        fields: Dict[str, Any] = {}
+        for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+            if result.get(key):
+                fields[key] = result.get(key)
+        if accepted:
+            fields["accepted_at"] = int(time.time())
+        return fields
 
     # ── Auth helper ──
 
@@ -813,8 +838,8 @@ def create_app(
                     "prompt": params["prompt"],
                     "message": str(primary_exc),
                 }
-            primary_accepted = is_video_acceptance_message(str(result.get("message") or ""))
-            if not result.get("videos"):
+            primary_accepted = _accepted_video_result(result)
+            if not result.get("videos") and not primary_accepted:
                 fallback = await client.generate_video_web(
                     prompt=params["prompt"],
                     ratio=params.get("ratio"),
@@ -845,6 +870,43 @@ def create_app(
         videos = result.get("videos", [])
         msg = result.get("message", "")
         if not videos:
+            if _accepted_video_result(result):
+                accounts.update_provider_quota_from_text(
+                    account["id"],
+                    "video",
+                    msg,
+                    units_completed=0,
+                )
+                accounts.mark_success(account["id"])
+                refreshed_account = accounts.store.get(account["id"]) or account
+                response = {
+                    "created": int(time.time()),
+                    "data": [],
+                    "pending": True,
+                    "accepted": True,
+                    "status": "in_progress",
+                    "account_id": account["id"],
+                    "quota": accounts.store.quota_snapshot(refreshed_account, "video"),
+                }
+                for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+                    if result.get(key):
+                        response[key] = result.get(key)
+                if params.get("reference_image_keys"):
+                    response["reference_image_keys"] = params["reference_image_keys"]
+                if msg:
+                    response["message"] = msg
+                if params.get("task_id"):
+                    video_tasks.update(
+                        str(params["task_id"]),
+                        "in_progress",
+                        result_json=json.dumps(response, ensure_ascii=False),
+                        message=msg,
+                        account_id=account["id"],
+                        quota_reservation_id=reservation_id,
+                        quota_units=quota_units,
+                        **_video_task_update_fields(response, accepted=True),
+                    )
+                return response
             message = msg or "No videos generated"
             if is_video_acceptance_message(message):
                 message = (
@@ -870,6 +932,9 @@ def create_app(
             "account_id": account["id"],
             "quota": accounts.store.quota_snapshot(refreshed_account, "video"),
         }
+        for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+            if result.get(key):
+                response[key] = result.get(key)
         if params.get("reference_image_keys"):
             response["reference_image_keys"] = params["reference_image_keys"]
         if msg:
@@ -972,6 +1037,9 @@ def create_app(
             response["progress"] = _openai_video_progress(status)
         if task.get("provider_model"):
             response["provider_model"] = task["provider_model"]
+        for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+            if task.get(key):
+                response[key] = task[key]
         if task.get("account_id"):
             response["account_id"] = task["account_id"]
         if task.get("ratio"):
@@ -1010,6 +1078,12 @@ def create_app(
                 response["data"] = data
                 response["output"] = data
                 response["result"] = {"data": data}
+                if result.get("pending"):
+                    response["pending"] = True
+                    response["accepted"] = bool(result.get("accepted", True))
+                for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+                    if result.get(key):
+                        response[key] = result.get(key)
                 if result.get("account_id"):
                     response["account_id"] = result.get("account_id")
                 if result.get("account_retry"):
@@ -1097,15 +1171,146 @@ def create_app(
                 result_json=json.dumps(result, ensure_ascii=False),
                 message=message,
                 account_id=result.get("account_id"),
+                **_video_task_update_fields(result, accepted=True),
             )
             return
         video_tasks.update(
             task_id,
             "completed",
             result_json=json.dumps(result, ensure_ascii=False),
+            error=None,
             message=message,
             account_id=result.get("account_id"),
+            **_video_task_update_fields(result),
         )
+
+    async def _recover_video_task_if_possible(
+        task_id: str,
+        task: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: Optional[float] = None,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        task = task or video_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Video task not found")
+        if task.get("status") in {"completed", "cancelled"}:
+            return task
+        if not VideoTaskStore._is_accepted_pending_result(
+            task.get("result_json"),
+            task.get("message"),
+        ):
+            return task
+
+        async with _video_lock(task_id):
+            task = video_tasks.get(task_id) or task
+            if task.get("status") in {"completed", "cancelled"}:
+                return task
+            if not VideoTaskStore._is_accepted_pending_result(
+                task.get("result_json"),
+                task.get("message"),
+            ):
+                return task
+
+            now = int(time.time())
+            max_age = int(os.environ.get("DOUBAO_VIDEO_ACCEPTED_MAX_AGE_SECONDS", "21600"))
+            if max_age > 0 and task.get("status") != "failed" and now - int(task.get("created") or now) > max_age:
+                message = f"Accepted video was not recoverable within {max_age} seconds"
+                accounts.release_quota(str(task.get("quota_reservation_id") or ""))
+                video_tasks.update(task_id, "failed", error=message, message=message)
+                if task.get("account_id"):
+                    accounts.record_task_failure(str(task["account_id"]), message)
+                return video_tasks.get(task_id) or task
+            min_interval = int(os.environ.get("DOUBAO_VIDEO_GET_RECOVERY_MIN_INTERVAL_SECONDS", "20"))
+            last_recovery_at = int(task.get("last_recovery_at") or 0)
+            if not force and last_recovery_at and now - last_recovery_at < max(1, min_interval):
+                return task
+
+            video_tasks.mark_recovery_attempt(task_id)
+            account_id = str(task.get("account_id") or accounts.default_account_id)
+            try:
+                account, client = await accounts.get_ready_client(account_id)
+            except Exception as exc:
+                log.warning("video recovery skipped for %s: account %s not ready: %s", task_id, account_id, exc)
+                return video_tasks.get(task_id) or task
+
+            conversation_id = str(task.get("conversation_id") or "")
+            if not conversation_id and task.get("result_json"):
+                try:
+                    result = json.loads(str(task["result_json"]))
+                    conversation_id = str(result.get("conversation_id") or "")
+                except json.JSONDecodeError:
+                    conversation_id = ""
+
+            recover_timeout = float(timeout if timeout is not None else os.environ.get("DOUBAO_VIDEO_RECOVERY_POLL_SECONDS", "20"))
+            try:
+                result = await client.recover_video_result(
+                    str(task.get("prompt") or ""),
+                    conversation_id=conversation_id or None,
+                    timeout=recover_timeout,
+                )
+            except Exception as exc:
+                log.warning("video recovery failed for %s: %s", task_id, exc)
+                return video_tasks.get(task_id) or task
+
+            videos = result.get("videos") or []
+            if not videos:
+                return video_tasks.get(task_id) or task
+
+            msg = str(task.get("message") or result.get("message") or "completed")
+            quota_units = int(task.get("quota_units") or 1)
+            accounts.complete_quota(str(task.get("quota_reservation_id") or ""))
+            accounts.update_provider_quota_from_text(
+                account["id"],
+                "video",
+                msg,
+                units_completed=quota_units,
+            )
+            accounts.mark_success(account["id"])
+            refreshed_account = accounts.store.get(account["id"]) or account
+            response = {
+                "created": int(time.time()),
+                "data": videos,
+                "account_id": account["id"],
+                "quota": accounts.store.quota_snapshot(refreshed_account, "video"),
+                "message": msg,
+                "recovered": True,
+            }
+            for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+                value = result.get(key) or task.get(key)
+                if value:
+                    response[key] = value
+            video_tasks.update(
+                task_id,
+                "completed",
+                result_json=json.dumps(response, ensure_ascii=False),
+                error=None,
+                message=msg,
+                account_id=account["id"],
+                **_video_task_update_fields(response),
+            )
+            return video_tasks.get(task_id) or task
+
+    async def _video_recovery_worker() -> None:
+        interval = int(os.environ.get("DOUBAO_VIDEO_RECOVERY_INTERVAL_SECONDS", "30"))
+        limit = int(os.environ.get("DOUBAO_VIDEO_RECOVERY_BATCH_SIZE", "10"))
+        while True:
+            await asyncio.sleep(max(5, interval))
+            try:
+                for task in video_tasks.recovery_candidates(
+                    min_interval_seconds=max(10, interval),
+                    limit=limit,
+                ):
+                    try:
+                        await _recover_video_task_if_possible(
+                            str(task["task_id"]),
+                            task,
+                            timeout=float(os.environ.get("DOUBAO_VIDEO_BACKGROUND_RECOVERY_SECONDS", "12")),
+                        )
+                    except Exception as exc:
+                        log.warning("video recovery worker task %s failed: %s", task.get("task_id"), exc)
+            except Exception as exc:
+                log.warning("video recovery worker loop failed: %s", exc)
 
     def _get_qianwen_client() -> QianwenClient:
         client = _qianwen.get("client")
@@ -1881,6 +2086,13 @@ def create_app(
         task = video_tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Video task not found")
+        if task.get("status") in {"queued", "in_progress", "failed"}:
+            task = await _recover_video_task_if_possible(
+                task_id,
+                task,
+                timeout=float(os.environ.get("DOUBAO_VIDEO_GET_RECOVERY_SECONDS", "4")),
+                force=_truthy(request.query_params.get("recover")),
+            )
         return JSONResponse(_format_video_task(task, openai=_is_openai_video_request(request)))
 
     @app.post("/v1/videos/{task_id}/cancel")
@@ -1945,6 +2157,13 @@ def create_app(
         task = video_tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Video task not found")
+        if task.get("status") in {"queued", "in_progress", "failed"}:
+            task = await _recover_video_task_if_possible(
+                task_id,
+                task,
+                timeout=float(os.environ.get("DOUBAO_VIDEO_GET_RECOVERY_SECONDS", "4")),
+                force=_truthy(request.query_params.get("recover")),
+            )
         return JSONResponse(_format_doubao_official_task(task))
 
     @app.post("/v1/files")
