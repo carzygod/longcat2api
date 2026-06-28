@@ -2250,8 +2250,15 @@ class BrowserClient:
                 "resend_for_regen": False,
                 "enable_commerce_credit": False,
                 "action_bar_skill_id": 17,
+                "conversation_init_option": {"need_ack_conversation": True},
             },
             "evaluate_option": {"web_ab_params": ""},
+            "ext": {
+                "conversation_init_option": json.dumps(
+                    {"need_ack_conversation": True},
+                    ensure_ascii=False,
+                ),
+            },
             "local_conversation_id": local_conversation_id,
             "local_message_id": local_message_id,
         }
