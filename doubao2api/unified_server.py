@@ -1428,7 +1428,7 @@ def create_app(
                         await _recover_video_task_if_possible(
                             str(task["task_id"]),
                             task,
-                            timeout=float(os.environ.get("DOUBAO_VIDEO_SINGLE_POLL_TIMEOUT_SECONDS", os.environ.get("DOUBAO_VIDEO_BACKGROUND_RECOVERY_SECONDS", "12"))),
+                            timeout=float(os.environ.get("DOUBAO_VIDEO_SINGLE_POLL_TIMEOUT_SECONDS", os.environ.get("DOUBAO_VIDEO_BACKGROUND_RECOVERY_SECONDS", "180"))),
                         )
                     except Exception as exc:
                         log.warning("video recovery worker task %s failed: %s", task.get("task_id"), exc)
