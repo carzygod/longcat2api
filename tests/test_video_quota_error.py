@@ -55,5 +55,14 @@ class VideoQuotaErrorTest(unittest.TestCase):
         self.assertFalse(is_video_acceptance_message("视频生成额度不足"))
 
 
+    def test_real_chinese_free_video_quota_exhausted_message_is_failed(self):
+        message = "正在为您生成视频...\n\n今日视频生成免费次数已用完。开通豆包专业版加强套餐，即可继续使用视频生成。"
+        self.assertTrue(is_quota_exhaustion_message(message))
+
+    def test_real_chinese_free_video_quota_exhausted_message_is_not_accepted(self):
+        message = "正在为您生成视频...\n\n今日视频生成免费次数已用完。开通豆包专业版加强套餐，即可继续使用视频生成。"
+        self.assertFalse(is_video_acceptance_message(message))
+
+
 if __name__ == "__main__":
     unittest.main()

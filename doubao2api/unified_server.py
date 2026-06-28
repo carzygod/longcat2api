@@ -265,6 +265,25 @@ def is_quota_exhaustion_message(message: str) -> bool:
         return False
     if re.search(r"(今日|今天)?\s*(剩余|还剩)\s*0\s*个?(视频生成额度|视频额度|生成额度|额度)?", text):
         return True
+    if "视频生成" in text and any(
+        marker in text
+        for marker in (
+            "今日视频生成免费次数已用完",
+            "视频生成免费次数已用完",
+            "免费次数已用完",
+            "次数已用完",
+            "即可继续使用视频生成",
+            "继续使用视频生成",
+            "开通豆包专业版",
+            "开通加强套餐",
+            "开通套餐",
+        )
+    ):
+        return True
+    if re.search(r"(今日|今天)?\s*(剩余|还剩)\s*[1-9]\d*\s*个?(视频生成额度|视频额度|生成额度|额度)", text):
+        return False
+    if re.search(r"(今日|今天)?\s*(剩余|还剩)\s*0\s*个?(视频生成额度|视频额度|生成额度|额度)?", text):
+        return True
     markers = (
         "exceed",
         "exceeded",
@@ -286,11 +305,24 @@ def is_quota_exhaustion_message(message: str) -> bool:
         "quota insufficient",
         "quota limit",
         "rate limit",
+        "积分不足",
+        "余额不足",
+        "权益不足",
+        "没有相关权益",
+        "没有视频生成权益",
+        "次数不足",
+        "次数已用完",
+        "免费次数已用完",
+        "额度不足",
+        "额度已用完",
+        "视频生成额度已用完",
     )
     return any(marker in text for marker in markers)
 
 
 def is_video_acceptance_message(message: str) -> bool:
+    if is_quota_exhaustion_message(message):
+        return False
     text = message or ""
     markers = (
         "正在为您生成视频",
@@ -869,6 +901,9 @@ def create_app(
 
         videos = result.get("videos", [])
         msg = result.get("message", "")
+        if _looks_quota_error(msg):
+            retry_next = await _handle_video_attempt_failure(account, client, reservation_id, msg, quota_units)
+            raise _VideoAttemptFailed(account["id"], msg, retry_next)
         if not videos:
             if _accepted_video_result(result):
                 accounts.update_provider_quota_from_text(
@@ -1068,7 +1103,7 @@ def create_app(
                 "type": "provider_quota_exhausted" if err_code == "quota_exhausted" else "api_error",
                 "code": err_code,
             }
-        if task.get("result_json"):
+        if task.get("result_json") and status not in {"failed", "cancelled"}:
             try:
                 result = json.loads(task["result_json"])
             except json.JSONDecodeError:
@@ -1124,7 +1159,7 @@ def create_app(
                 "code": "video_generation_failed",
                 "message": task["error"],
             }
-        if task.get("result_json"):
+        if task.get("result_json") and status != "failed":
             try:
                 result = json.loads(task["result_json"])
             except json.JSONDecodeError:

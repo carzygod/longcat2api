@@ -1829,7 +1829,39 @@ class BrowserClient:
         }
 
     @staticmethod
+    def _is_video_terminal_failure_text(text: str) -> bool:
+        lowered = (text or "").lower()
+        if "视频生成" in lowered and any(marker in lowered for marker in (
+            "今日视频生成免费次数已用完",
+            "视频生成免费次数已用完",
+            "免费次数已用完",
+            "次数已用完",
+            "即可继续使用视频生成",
+            "继续使用视频生成",
+            "开通豆包专业版",
+            "开通加强套餐",
+            "开通套餐",
+        )):
+            return True
+        return any(marker in lowered for marker in (
+            "积分不足",
+            "余额不足",
+            "权益不足",
+            "没有相关权益",
+            "没有视频生成权益",
+            "额度不足",
+            "额度已用完",
+            "视频生成额度已用完",
+            "quota exceeded",
+            "quota exhausted",
+            "quota insufficient",
+            "quota limit",
+        ))
+
+    @staticmethod
     def _is_video_acceptance_text(text: str) -> bool:
+        if BrowserClient._is_video_terminal_failure_text(text):
+            return False
         lowered = (text or "").lower()
         return any(marker in lowered for marker in (
             "正在为您生成视频",

@@ -56,6 +56,12 @@ class BrowserVideoPayloadTest(unittest.TestCase):
 
         self.assertTrue(browser_client.BrowserClient._is_video_acceptance_text(message))
 
+    def test_video_quota_exhausted_text_is_not_acceptance(self):
+        message = "正在为您生成视频...\n\n今日视频生成免费次数已用完。开通豆包专业版加强套餐，即可继续使用视频生成。"
+
+        self.assertTrue(browser_client.BrowserClient._is_video_terminal_failure_text(message))
+        self.assertFalse(browser_client.BrowserClient._is_video_acceptance_text(message))
+
     def test_video_message_contains_all_reference_attachments(self):
         message = browser_client.BrowserClient._build_video_message(
             prompt="animate",
