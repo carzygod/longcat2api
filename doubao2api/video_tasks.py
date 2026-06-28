@@ -138,24 +138,33 @@ class VideoTaskStore:
         ))
 
     @staticmethod
-    def _is_accepted_pending_result(result_json: Any, message: Any = "") -> bool:
+    def _is_accepted_pending_result(
+        result_json: Any,
+        message: Any = "",
+        *,
+        provider_task_id: Any = "",
+        conversation_id: Any = "",
+    ) -> bool:
         if isinstance(result_json, str) and result_json.strip():
             try:
                 result_json = json.loads(result_json)
             except json.JSONDecodeError:
                 result_json = {}
+        has_binding_id = bool(str(provider_task_id or "").strip() or str(conversation_id or "").strip())
         if isinstance(result_json, dict):
             message = message or result_json.get("message", "")
             if VideoTaskStore._is_terminal_failure_message(message):
                 return False
-            if result_json.get("pending") and (
-                result_json.get("accepted")
-                or result_json.get("conversation_id")
-                or result_json.get("provider_task_id")
-            ):
+            has_binding_id = has_binding_id or bool(
+                str(result_json.get("conversation_id") or "").strip()
+                or str(result_json.get("provider_task_id") or "").strip()
+            )
+            if has_binding_id and result_json.get("pending"):
                 return True
         text = str(message or "").lower()
         if VideoTaskStore._is_terminal_failure_message(text):
+            return False
+        if not has_binding_id:
             return False
         return any(
             marker in text
@@ -178,14 +187,19 @@ class VideoTaskStore:
         with self._lock, self._connection() as conn:
             rows = conn.execute(
                 """
-                SELECT task_id, status, result_json, message
+                SELECT task_id, status, result_json, message, provider_task_id, conversation_id
                   FROM video_tasks
                  WHERE status IN ('queued', 'in_progress')
                 """
             ).fetchall()
             for row in rows:
                 task_id = row["task_id"]
-                if self._is_accepted_pending_result(row["result_json"], row["message"]):
+                if self._is_accepted_pending_result(
+                    row["result_json"],
+                    row["message"],
+                    provider_task_id=row["provider_task_id"],
+                    conversation_id=row["conversation_id"],
+                ):
                     conn.execute(
                         """
                         UPDATE video_tasks
@@ -341,7 +355,12 @@ class VideoTaskStore:
         return [
             dict(row)
             for row in rows
-            if self._is_accepted_pending_result(row["result_json"], row["message"])
+            if self._is_accepted_pending_result(
+                row["result_json"],
+                row["message"],
+                provider_task_id=row["provider_task_id"],
+                conversation_id=row["conversation_id"],
+            )
         ]
 
     def counts(self) -> Dict[str, int]:

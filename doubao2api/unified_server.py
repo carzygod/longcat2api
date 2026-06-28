@@ -438,6 +438,7 @@ def create_app(
     video_tasks.normalize_completed()
     video_tasks.cleanup()
     _video_recovery_locks: Dict[str, asyncio.Lock] = {}
+    _video_account_locks: Dict[str, asyncio.Lock] = {}
 
     def _video_lock(task_id: str) -> asyncio.Lock:
         lock = _video_recovery_locks.get(task_id)
@@ -446,8 +447,21 @@ def create_app(
             _video_recovery_locks[task_id] = lock
         return lock
 
+    def _video_account_lock(account_id: str) -> asyncio.Lock:
+        lock = _video_account_locks.get(account_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _video_account_locks[account_id] = lock
+        return lock
+
     def _accepted_video_result(result: Dict[str, Any]) -> bool:
-        if result.get("accepted") or result.get("pending") or result.get("provider_task_id"):
+        has_binding_id = bool(
+            str(result.get("provider_task_id") or "").strip()
+            or str(result.get("conversation_id") or "").strip()
+        )
+        if not has_binding_id:
+            return False
+        if result.get("accepted") or result.get("pending"):
             return True
         return is_video_acceptance_message(str(result.get("message") or ""))
 
@@ -459,6 +473,21 @@ def create_app(
         if accepted:
             fields["accepted_at"] = int(time.time())
         return fields
+
+    def _video_task_binding_ids(task: Dict[str, Any]) -> tuple[str, str, str]:
+        provider_task_id = str(task.get("provider_task_id") or "")
+        conversation_id = str(task.get("conversation_id") or "")
+        local_conversation_id = str(task.get("local_conversation_id") or "")
+        if task.get("result_json"):
+            try:
+                result = json.loads(str(task["result_json"]))
+            except json.JSONDecodeError:
+                result = {}
+            if isinstance(result, dict):
+                provider_task_id = provider_task_id or str(result.get("provider_task_id") or "")
+                conversation_id = conversation_id or str(result.get("conversation_id") or "")
+                local_conversation_id = local_conversation_id or str(result.get("local_conversation_id") or "")
+        return provider_task_id, conversation_id, local_conversation_id
 
     # ── Auth helper ──
 
@@ -840,21 +869,21 @@ def create_app(
             params["quota_reservation_id"] = reservation_id
             params["quota_units"] = quota_units
         try:
-            reference_image_infos = await _materialize_video_reference_image_infos(client, params)
-            reference_image_keys = [str(info["uri"]) for info in reference_image_infos if info.get("uri")]
-            ref_image_key = reference_image_keys[0] if reference_image_keys else None
-            params["ref_image_key"] = ref_image_key
-            params["reference_image_keys"] = reference_image_keys
-            params["reference_image_infos"] = reference_image_infos
-            if params.get("task_id"):
-                video_tasks.update(
-                    str(params["task_id"]),
-                    "in_progress",
-                    ref_image_key=ref_image_key,
-                    reference_image_keys=json.dumps(reference_image_keys, ensure_ascii=False),
-                )
-            try:
-                result = await client.generate_video(
+            async with _video_account_lock(account["id"]):
+                reference_image_infos = await _materialize_video_reference_image_infos(client, params)
+                reference_image_keys = [str(info["uri"]) for info in reference_image_infos if info.get("uri")]
+                ref_image_key = reference_image_keys[0] if reference_image_keys else None
+                params["ref_image_key"] = ref_image_key
+                params["reference_image_keys"] = reference_image_keys
+                params["reference_image_infos"] = reference_image_infos
+                if params.get("task_id"):
+                    video_tasks.update(
+                        str(params["task_id"]),
+                        "in_progress",
+                        ref_image_key=ref_image_key,
+                        reference_image_keys=json.dumps(reference_image_keys, ensure_ascii=False),
+                    )
+                result = await client.submit_video(
                     prompt=params["prompt"],
                     ratio=params.get("ratio"),
                     ref_image_key=ref_image_key,
@@ -863,32 +892,6 @@ def create_app(
                     model=params.get("provider_model"),
                     duration=params.get("duration"),
                 )
-            except RuntimeError as primary_exc:
-                log.warning("generate_video task polling path failed, falling back to web ability: %s", primary_exc)
-                result = {
-                    "videos": [],
-                    "prompt": params["prompt"],
-                    "message": str(primary_exc),
-                }
-            primary_accepted = _accepted_video_result(result)
-            if not result.get("videos") and not primary_accepted:
-                fallback = await client.generate_video_web(
-                    prompt=params["prompt"],
-                    ratio=params.get("ratio"),
-                    ref_image_key=ref_image_key,
-                    reference_image_keys=reference_image_keys,
-                    reference_image_infos=reference_image_infos,
-                    model=params.get("provider_model"),
-                    duration=params.get("duration"),
-                )
-                if fallback.get("videos"):
-                    fallback["message"] = fallback.get("message") or "completed"
-                    result = fallback
-                elif is_video_acceptance_message(str(fallback.get("message") or "")):
-                    fallback["message"] = fallback.get("message") or result.get("message", "")
-                    result = fallback
-                elif not primary_accepted:
-                    result = fallback
         except HTTPException:
             accounts.release_quota(reservation_id)
             raise
@@ -942,11 +945,11 @@ def create_app(
                         **_video_task_update_fields(response, accepted=True),
                     )
                 return response
-            message = msg or "No videos generated"
+            message = msg or "Video generation submit did not return task_id or conversation_id"
             if is_video_acceptance_message(message):
                 message = (
                     "Provider accepted the video request but did not expose a "
-                    f"retrievable task or video URL after polling. Last provider message: {message}"
+                    f"retrievable task_id or conversation_id. Last provider message: {message}"
                 )
             retry_next = await _handle_video_attempt_failure(account, client, reservation_id, message, quota_units)
             raise _VideoAttemptFailed(account["id"], message, retry_next)
@@ -1229,30 +1232,60 @@ def create_app(
         task = task or video_tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Video task not found")
-        if task.get("status") in {"completed", "cancelled"}:
+        if task.get("status") in {"completed", "cancelled", "failed"}:
             return task
         if _looks_quota_error(str(task.get("message") or task.get("error") or "")):
             return task
+        provider_task_id, conversation_id, _local_conversation_id = _video_task_binding_ids(task)
+        if (
+            task.get("status") == "in_progress"
+            and not provider_task_id
+            and not conversation_id
+            and (task.get("result_json") or task.get("message") or task.get("accepted_at"))
+        ):
+            message = "Video generation submit did not return task_id or conversation_id"
+            accounts.release_quota(str(task.get("quota_reservation_id") or ""))
+            video_tasks.update(task_id, "failed", error=message, message=message)
+            if task.get("account_id"):
+                accounts.record_task_failure(str(task["account_id"]), message)
+            return video_tasks.get(task_id) or task
         if not VideoTaskStore._is_accepted_pending_result(
             task.get("result_json"),
             task.get("message"),
+            provider_task_id=provider_task_id,
+            conversation_id=conversation_id,
         ):
             return task
 
         async with _video_lock(task_id):
             task = video_tasks.get(task_id) or task
-            if task.get("status") in {"completed", "cancelled"}:
+            if task.get("status") in {"completed", "cancelled", "failed"}:
                 return task
             if _looks_quota_error(str(task.get("message") or task.get("error") or "")):
                 return task
+            provider_task_id, conversation_id, _local_conversation_id = _video_task_binding_ids(task)
+            if (
+                task.get("status") == "in_progress"
+                and not provider_task_id
+                and not conversation_id
+                and (task.get("result_json") or task.get("message") or task.get("accepted_at"))
+            ):
+                message = "Video generation submit did not return task_id or conversation_id"
+                accounts.release_quota(str(task.get("quota_reservation_id") or ""))
+                video_tasks.update(task_id, "failed", error=message, message=message)
+                if task.get("account_id"):
+                    accounts.record_task_failure(str(task["account_id"]), message)
+                return video_tasks.get(task_id) or task
             if not VideoTaskStore._is_accepted_pending_result(
                 task.get("result_json"),
                 task.get("message"),
+                provider_task_id=provider_task_id,
+                conversation_id=conversation_id,
             ):
                 return task
 
             now = int(time.time())
-            max_age = int(os.environ.get("DOUBAO_VIDEO_ACCEPTED_MAX_AGE_SECONDS", "21600"))
+            max_age = int(os.environ.get("DOUBAO_VIDEO_MAX_WAIT_SECONDS", os.environ.get("DOUBAO_VIDEO_ACCEPTED_MAX_AGE_SECONDS", "600")))
             if max_age > 0 and task.get("status") != "failed" and now - int(task.get("created") or now) > max_age:
                 message = f"Accepted video was not recoverable within {max_age} seconds"
                 accounts.release_quota(str(task.get("quota_reservation_id") or ""))
@@ -1260,7 +1293,7 @@ def create_app(
                 if task.get("account_id"):
                     accounts.record_task_failure(str(task["account_id"]), message)
                 return video_tasks.get(task_id) or task
-            min_interval = int(os.environ.get("DOUBAO_VIDEO_GET_RECOVERY_MIN_INTERVAL_SECONDS", "20"))
+            min_interval = int(os.environ.get("DOUBAO_VIDEO_POLL_INTERVAL_SECONDS", os.environ.get("DOUBAO_VIDEO_GET_RECOVERY_MIN_INTERVAL_SECONDS", "15")))
             last_recovery_at = int(task.get("last_recovery_at") or 0)
             if not force and last_recovery_at and now - last_recovery_at < max(1, min_interval):
                 return task
@@ -1273,31 +1306,42 @@ def create_app(
                 log.warning("video recovery skipped for %s: account %s not ready: %s", task_id, account_id, exc)
                 return video_tasks.get(task_id) or task
 
-            conversation_id = str(task.get("conversation_id") or "")
-            if not conversation_id and task.get("result_json"):
-                try:
-                    result = json.loads(str(task["result_json"]))
-                    conversation_id = str(result.get("conversation_id") or "")
-                except json.JSONDecodeError:
-                    conversation_id = ""
-
             recover_timeout = float(timeout if timeout is not None else os.environ.get("DOUBAO_VIDEO_RECOVERY_POLL_SECONDS", "20"))
             try:
-                result = await client.recover_video_result(
-                    str(task.get("prompt") or ""),
-                    conversation_id=conversation_id or None,
-                    timeout=recover_timeout,
-                )
+                async with _video_account_lock(account["id"]):
+                    if provider_task_id:
+                        result = await client.poll_video_result(
+                            provider_task_id,
+                            str(task.get("prompt") or ""),
+                            timeout=recover_timeout,
+                        )
+                    else:
+                        result = await client.recover_video_result(
+                            str(task.get("prompt") or ""),
+                            conversation_id=conversation_id or None,
+                            timeout=recover_timeout,
+                        )
             except Exception as exc:
                 log.warning("video recovery failed for %s: %s", task_id, exc)
                 return video_tasks.get(task_id) or task
 
             videos = result.get("videos") or []
+            result_msg = str(result.get("message") or "")
+            quota_units = int(task.get("quota_units") or 1)
+            if _looks_quota_error(result_msg):
+                await _handle_video_attempt_failure(
+                    account,
+                    client,
+                    str(task.get("quota_reservation_id") or ""),
+                    result_msg,
+                    quota_units,
+                )
+                video_tasks.update(task_id, "failed", error=result_msg, message=result_msg)
+                return video_tasks.get(task_id) or task
             if not videos:
                 return video_tasks.get(task_id) or task
 
             msg = str(task.get("message") or result.get("message") or "completed")
-            quota_units = int(task.get("quota_units") or 1)
             accounts.complete_quota(str(task.get("quota_reservation_id") or ""))
             accounts.update_provider_quota_from_text(
                 account["id"],
@@ -1331,20 +1375,20 @@ def create_app(
             return video_tasks.get(task_id) or task
 
     async def _video_recovery_worker() -> None:
-        interval = int(os.environ.get("DOUBAO_VIDEO_RECOVERY_INTERVAL_SECONDS", "30"))
+        interval = int(os.environ.get("DOUBAO_VIDEO_POLL_INTERVAL_SECONDS", os.environ.get("DOUBAO_VIDEO_RECOVERY_INTERVAL_SECONDS", "15")))
         limit = int(os.environ.get("DOUBAO_VIDEO_RECOVERY_BATCH_SIZE", "10"))
         while True:
-            await asyncio.sleep(max(5, interval))
+            await asyncio.sleep(max(1, interval))
             try:
                 for task in video_tasks.recovery_candidates(
-                    min_interval_seconds=max(10, interval),
+                    min_interval_seconds=max(1, interval),
                     limit=limit,
                 ):
                     try:
                         await _recover_video_task_if_possible(
                             str(task["task_id"]),
                             task,
-                            timeout=float(os.environ.get("DOUBAO_VIDEO_BACKGROUND_RECOVERY_SECONDS", "12")),
+                            timeout=float(os.environ.get("DOUBAO_VIDEO_SINGLE_POLL_TIMEOUT_SECONDS", os.environ.get("DOUBAO_VIDEO_BACKGROUND_RECOVERY_SECONDS", "12"))),
                         )
                     except Exception as exc:
                         log.warning("video recovery worker task %s failed: %s", task.get("task_id"), exc)
@@ -2125,7 +2169,7 @@ def create_app(
         task = video_tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Video task not found")
-        if task.get("status") in {"queued", "in_progress", "failed"}:
+        if task.get("status") in {"queued", "in_progress"}:
             task = await _recover_video_task_if_possible(
                 task_id,
                 task,
@@ -2196,7 +2240,7 @@ def create_app(
         task = video_tasks.get(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="Video task not found")
-        if task.get("status") in {"queued", "in_progress", "failed"}:
+        if task.get("status") in {"queued", "in_progress"}:
             task = await _recover_video_task_if_possible(
                 task_id,
                 task,

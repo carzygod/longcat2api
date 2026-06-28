@@ -1883,10 +1883,13 @@ class BrowserClient:
 
         if not self._page:
             return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
+        if not conversation_id:
+            log.info("generate_video_web: skip UI recovery without conversation_id")
+            return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
 
         video_regex = re.compile(r"(mp4|m3u8|douyinvod|mime_type=video_mp4|video_gen)", re.I)
         prompt_snippet = (prompt or "").strip()[:48]
-        require_prompt_match = not conversation_id
+        require_prompt_match = False
         deadline = time.time() + timeout
         visited: set[str] = set()
 
@@ -1952,6 +1955,7 @@ class BrowserClient:
             return videos
 
         async def candidate_urls() -> List[str]:
+            return [f"{DOUBAO_URL}/chat/{conversation_id}"]
             current = self._page.url
             links = await self._page.evaluate(
                 """() => Array.from(document.querySelectorAll('a[href*="/chat/"]'))
@@ -2019,7 +2023,16 @@ class BrowserClient:
             timeout=timeout,
         )
 
-    async def generate_video(
+    async def poll_video_result(
+        self,
+        provider_task_id: str,
+        prompt: str,
+        timeout: float = 30,
+    ) -> Dict[str, Any]:
+        """Poll an already submitted Samantha video task by provider task ID."""
+        return await self._poll_video_result(provider_task_id, prompt, timeout=timeout)
+
+    async def submit_video(
         self,
         prompt: str,
         ratio: Optional[str] = None,
@@ -2029,7 +2042,7 @@ class BrowserClient:
         model: Optional[str] = None,
         duration: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Generate video using /samantha/chat/completion (async 2-step).
+        """Submit a video job and return provider binding IDs only.
 
         Args:
             prompt: Text description of the video to generate.
@@ -2038,7 +2051,9 @@ class BrowserClient:
             reference_image_keys: Optional list of uploaded image keys for multi-image reference.
 
         Returns:
-            Dict with 'videos' list, each having video_url/cover_url/duration.
+            Dict describing an accepted pending job. Completion is intentionally
+            handled by a separate polling step because Doubao Web always queues
+            video generation before exposing a video URL.
         """
         import base64
 
@@ -2059,6 +2074,7 @@ class BrowserClient:
         )
 
         local_conversation_id = str(uuid.uuid4())
+        local_message_id = str(uuid.uuid4())
         payload = {
             "messages": [message],
             "completion_option": {
@@ -2079,10 +2095,10 @@ class BrowserClient:
             },
             "evaluate_option": {"web_ab_params": ""},
             "local_conversation_id": local_conversation_id,
-            "local_message_id": str(uuid.uuid4()),
+            "local_message_id": local_message_id,
         }
 
-        log.info("generate_video: prompt=%s, ratio=%s", prompt[:50], ratio)
+        log.info("submit_video: prompt=%s, ratio=%s", prompt[:50], ratio)
         raw = await self._samantha_request(payload, timeout=60)
 
         # Phase 1: Extract async task_id from fin_reason
@@ -2132,42 +2148,79 @@ class BrowserClient:
         if "服务过载" in full_text or "重试" in full_text:
             raise RuntimeError("视频生成服务过载，请稍后重试")
 
-        if not task_id:
-            # Maybe sync result with content_type=2021, or just text response
+        if not task_id and not conversation_id:
             if full_text:
-                if self._is_video_acceptance_text(full_text):
-                    if conversation_id:
-                        log.info("generate_video: accepted without task_id; waiting on conversation_id=%s", conversation_id)
-                    ui_result = await self._wait_for_video_result_from_ui(
-                        prompt,
-                        conversation_id=conversation_id or None,
-                    )
-                    return {
-                        "videos": ui_result.get("videos", []),
-                        "prompt": prompt,
-                        "message": full_text,
-                        "conversation_id": conversation_id,
-                        "local_conversation_id": local_conversation_id,
-                        "pending": not bool(ui_result.get("videos")),
-                        "accepted": True,
-                    }
                 return {
                     "videos": [],
                     "prompt": prompt,
                     "message": full_text,
                     "conversation_id": conversation_id,
                     "local_conversation_id": local_conversation_id,
+                    "local_message_id": local_message_id,
                 }
-            raise RuntimeError("Video generation: no task_id returned")
+            raise RuntimeError("Video generation submit did not return task_id or conversation_id")
+
+        accepted = bool(task_id) or bool(
+            conversation_id and (not full_text or self._is_video_acceptance_text(full_text))
+        )
+        if not accepted:
+            return {
+                "videos": [],
+                "prompt": prompt,
+                "message": full_text,
+                "provider_task_id": task_id,
+                "conversation_id": conversation_id,
+                "local_conversation_id": local_conversation_id,
+                "local_message_id": local_message_id,
+            }
+
+        result = {
+            "videos": [],
+            "prompt": prompt,
+            "message": full_text,
+            "provider_task_id": task_id,
+            "conversation_id": conversation_id,
+            "local_conversation_id": local_conversation_id,
+            "local_message_id": local_message_id,
+            "pending": True,
+            "accepted": True,
+        }
+        return result
+
+    async def generate_video(
+        self,
+        prompt: str,
+        ratio: Optional[str] = None,
+        ref_image_key: Optional[str] = None,
+        reference_image_keys: Optional[List[str]] = None,
+        reference_image_infos: Optional[List[Dict[str, Any]]] = None,
+        model: Optional[str] = None,
+        duration: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Generate video using /samantha/chat/completion (legacy wait path)."""
+        submitted = await self.submit_video(
+            prompt=prompt,
+            ratio=ratio,
+            ref_image_key=ref_image_key,
+            reference_image_keys=reference_image_keys,
+            reference_image_infos=reference_image_infos,
+            model=model,
+            duration=duration,
+        )
+        task_id = str(submitted.get("provider_task_id") or "")
+        if not task_id:
+            return submitted
 
         # Phase 2: Poll for result
         log.info("generate_video: polling task_id=%s", task_id)
         result = await self._poll_video_result(task_id, prompt)
+        full_text = str(submitted.get("message") or "")
         if full_text and not result.get("message"):
             result["message"] = full_text
         result.setdefault("provider_task_id", task_id)
-        result.setdefault("conversation_id", conversation_id)
-        result.setdefault("local_conversation_id", local_conversation_id)
+        result.setdefault("conversation_id", submitted.get("conversation_id") or "")
+        result.setdefault("local_conversation_id", submitted.get("local_conversation_id") or "")
+        result.setdefault("local_message_id", submitted.get("local_message_id") or "")
         if not result.get("videos"):
             result.setdefault("pending", True)
             result.setdefault("accepted", True)
@@ -2184,8 +2237,15 @@ class BrowserClient:
         raw = await self._samantha_request(poll_payload, timeout=timeout)
 
         videos = []
+        text_parts: List[str] = []
+        error_parts: List[str] = []
         for data in self._parse_samantha_sse(raw):
             et = data.get("event_type")
+            if et == 2005:
+                detail = data.get("event_data", "")
+                if detail:
+                    error_parts.append(str(detail))
+                continue
             if et != 2001:
                 continue
 
@@ -2202,6 +2262,17 @@ class BrowserClient:
                     msg = json.loads(msg)
                 except json.JSONDecodeError:
                     continue
+
+            if msg.get("content_type") == 2001:
+                content_raw = msg.get("content", "")
+                if isinstance(content_raw, str):
+                    try:
+                        content = json.loads(content_raw)
+                        if isinstance(content, dict) and content.get("text"):
+                            text_parts.append(str(content.get("text")))
+                    except json.JSONDecodeError:
+                        pass
+                continue
 
             if msg.get("content_type") != 2021:
                 continue
@@ -2246,7 +2317,11 @@ class BrowserClient:
                     })
 
         log.info("generate_video: got %d videos", len(videos))
-        return {"videos": videos, "prompt": prompt}
+        result: Dict[str, Any] = {"videos": videos, "prompt": prompt}
+        message = "".join(text_parts).strip() or "\n".join(error_parts).strip()
+        if message:
+            result["message"] = message
+        return result
 
     # ------------------------------------------------------------------
     # File upload (TOS / ImageX flow)

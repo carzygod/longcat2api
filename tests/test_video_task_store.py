@@ -93,12 +93,14 @@ class VideoTaskStoreTest(unittest.TestCase):
                 "pending": True,
                 "accepted": True,
                 "message": "video generation accepted",
+                "provider_task_id": "provider-video-task",
             }
             store.update(
                 "video-accepted-pending",
                 "in_progress",
                 result_json=json.dumps(pending_result),
                 message="video generation accepted",
+                provider_task_id="provider-video-task",
             )
 
             store.mark_interrupted()
@@ -110,7 +112,7 @@ class VideoTaskStoreTest(unittest.TestCase):
             self.assertEqual(task["message"], "video generation accepted")
             self.assertEqual(json.loads(task["result_json"]), pending_result)
 
-    def test_mark_interrupted_keeps_task_with_accepted_message_only(self):
+    def test_mark_interrupted_fails_task_with_accepted_message_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "video_tasks.sqlite3"
             store = VideoTaskStore(str(db_path))
@@ -129,8 +131,8 @@ class VideoTaskStoreTest(unittest.TestCase):
             task = store.get("video-message-pending")
 
             self.assertIsNotNone(task)
-            self.assertEqual(task["status"], "in_progress")
-            self.assertIsNone(task["error"])
+            self.assertEqual(task["status"], "failed")
+            self.assertIn("server restarted", task["error"])
             self.assertEqual(
                 task["message"],
                 "The service is generating video and will notify when ready.",
@@ -153,8 +155,13 @@ class VideoTaskStoreTest(unittest.TestCase):
             store.update(
                 "video-pending",
                 "in_progress",
-                result_json=json.dumps({"pending": True, "accepted": True}),
+                result_json=json.dumps({
+                    "pending": True,
+                    "accepted": True,
+                    "provider_task_id": "provider-video-task",
+                }),
                 message="video generation accepted",
+                provider_task_id="provider-video-task",
                 accepted_at=123,
             )
             store.update("video-plain", "in_progress", message="still working")
