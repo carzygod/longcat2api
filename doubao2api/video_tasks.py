@@ -166,6 +166,7 @@ class VideoTaskStore:
             has_binding_id = has_binding_id or bool(
                 str(result_json.get("conversation_id") or "").strip()
                 or str(result_json.get("provider_task_id") or "").strip()
+                or str(result_json.get("conversation_url") or "").strip()
             )
             if has_binding_id and result_json.get("pending"):
                 return True

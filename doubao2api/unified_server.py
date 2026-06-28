@@ -482,6 +482,7 @@ def create_app(
         has_binding_id = bool(
             str(result.get("provider_task_id") or "").strip()
             or str(result.get("conversation_id") or "").strip()
+            or str(result.get("conversation_url") or "").strip()
         )
         if not has_binding_id:
             return False
@@ -498,10 +499,11 @@ def create_app(
             fields["accepted_at"] = int(time.time())
         return fields
 
-    def _video_task_binding_ids(task: Dict[str, Any]) -> tuple[str, str, str]:
+    def _video_task_binding_ids(task: Dict[str, Any]) -> tuple[str, str, str, str]:
         provider_task_id = str(task.get("provider_task_id") or "")
         conversation_id = str(task.get("conversation_id") or "")
         local_conversation_id = str(task.get("local_conversation_id") or "")
+        conversation_url = ""
         if task.get("result_json"):
             try:
                 result = json.loads(str(task["result_json"]))
@@ -511,7 +513,8 @@ def create_app(
                 provider_task_id = provider_task_id or str(result.get("provider_task_id") or "")
                 conversation_id = conversation_id or str(result.get("conversation_id") or "")
                 local_conversation_id = local_conversation_id or str(result.get("local_conversation_id") or "")
-        return provider_task_id, conversation_id, local_conversation_id
+                conversation_url = str(result.get("conversation_url") or "")
+        return provider_task_id, conversation_id, local_conversation_id, conversation_url
 
     def _video_task_provider_task_candidates(task: Dict[str, Any]) -> list[str]:
         candidates: list[str] = []
@@ -984,7 +987,7 @@ def create_app(
                     "account_id": account["id"],
                     "quota": accounts.store.quota_snapshot(refreshed_account, "video"),
                 }
-                for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+                for key in ("provider_task_id", "conversation_id", "local_conversation_id", "conversation_url"):
                     if result.get(key):
                         response[key] = result.get(key)
                 for key in (
@@ -1038,7 +1041,7 @@ def create_app(
             "account_id": account["id"],
             "quota": accounts.store.quota_snapshot(refreshed_account, "video"),
         }
-        for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+        for key in ("provider_task_id", "conversation_id", "local_conversation_id", "conversation_url"):
             if result.get(key):
                 response[key] = result.get(key)
         for key in (
@@ -1153,7 +1156,7 @@ def create_app(
             response["progress"] = _openai_video_progress(status)
         if task.get("provider_model"):
             response["provider_model"] = task["provider_model"]
-        for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+        for key in ("provider_task_id", "conversation_id", "local_conversation_id", "conversation_url"):
             if task.get(key):
                 response[key] = task[key]
         if task.get("account_id"):
@@ -1197,7 +1200,7 @@ def create_app(
                 if result.get("pending"):
                     response["pending"] = True
                     response["accepted"] = bool(result.get("accepted", True))
-                for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+                for key in ("provider_task_id", "conversation_id", "local_conversation_id", "conversation_url"):
                     if result.get(key):
                         response[key] = result.get(key)
                 for key in (
@@ -1324,11 +1327,12 @@ def create_app(
             return task
         if _looks_quota_error(str(task.get("message") or task.get("error") or "")):
             return task
-        provider_task_id, conversation_id, _local_conversation_id = _video_task_binding_ids(task)
+        provider_task_id, conversation_id, _local_conversation_id, conversation_url = _video_task_binding_ids(task)
         if (
             task.get("status") == "in_progress"
             and not provider_task_id
             and not conversation_id
+            and not conversation_url
             and (task.get("result_json") or task.get("message") or task.get("accepted_at"))
         ):
             message = "Video generation submit did not return task_id or conversation_id"
@@ -1351,11 +1355,12 @@ def create_app(
                 return task
             if _looks_quota_error(str(task.get("message") or task.get("error") or "")):
                 return task
-            provider_task_id, conversation_id, _local_conversation_id = _video_task_binding_ids(task)
+            provider_task_id, conversation_id, _local_conversation_id, conversation_url = _video_task_binding_ids(task)
             if (
                 task.get("status") == "in_progress"
                 and not provider_task_id
                 and not conversation_id
+                and not conversation_url
                 and (task.get("result_json") or task.get("message") or task.get("accepted_at"))
             ):
                 message = "Video generation submit did not return task_id or conversation_id"
@@ -1398,10 +1403,11 @@ def create_app(
             try:
                 async with _video_account_lock(account["id"]):
                     provider_task_candidates = _video_task_provider_task_candidates(task)
-                    if conversation_id:
+                    if conversation_id or conversation_url:
                         result = await client.recover_video_result(
                             str(task.get("prompt") or ""),
-                            conversation_id=conversation_id,
+                            conversation_id=conversation_id or None,
+                            conversation_url=conversation_url or None,
                             timeout=recover_timeout,
                         )
                     elif provider_task_candidates:
@@ -1465,7 +1471,7 @@ def create_app(
                 "message": msg,
                 "recovered": True,
             }
-            for key in ("provider_task_id", "conversation_id", "local_conversation_id"):
+            for key in ("provider_task_id", "conversation_id", "local_conversation_id", "conversation_url"):
                 value = result.get(key) or task.get(key)
                 if value:
                     response[key] = value

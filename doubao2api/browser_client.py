@@ -1975,21 +1975,29 @@ class BrowserClient:
             walk(event)
 
         full_text = fix_mojibake("".join(text_parts).strip())
+        conversation_url = self._page.url if self._page else ""
+        if not conversation_id and conversation_url:
+            match = re.search(r"/chat/(\d{8,})", conversation_url)
+            if match:
+                conversation_id = match.group(1)
         log.info("generate_video_web: got %d videos; text=%s", len(videos), full_text[:120])
         if not videos and self._is_video_acceptance_text(full_text):
             if wait_for_result:
                 ui_result = await self._wait_for_video_result_from_ui(
                     prompt,
                     conversation_id=conversation_id or None,
+                    conversation_url=conversation_url or None,
                     timeout=float(ui_timeout if ui_timeout is not None else os.environ.get("DOUBAO_VIDEO_UI_WAIT_SECONDS", "360")),
                 )
                 videos.extend(ui_result.get("videos", []))
                 conversation_id = conversation_id or str(ui_result.get("conversation_id") or "")
+                conversation_url = conversation_url or str(ui_result.get("conversation_url") or "")
         result = {
             "videos": videos,
             "prompt": prompt,
             "message": full_text,
             "conversation_id": conversation_id,
+            "conversation_url": conversation_url,
         }
         if not videos and self._is_video_acceptance_text(full_text):
             result["pending"] = True
@@ -2057,20 +2065,32 @@ class BrowserClient:
         self,
         prompt: str,
         conversation_id: Optional[str] = None,
+        conversation_url: Optional[str] = None,
         timeout: float = 360,
     ) -> Dict[str, Any]:
         """Wait for Doubao's web UI notification card and extract its video URL."""
         import re
 
         if not self._page:
-            return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
-        if not conversation_id:
-            log.info("generate_video_web: skip UI recovery without conversation_id")
-            return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
+            return {
+                "videos": [],
+                "prompt": prompt,
+                "conversation_id": conversation_id,
+                "conversation_url": conversation_url,
+            }
+        bound_url = conversation_url or self._page.url
+        if not conversation_id and not bound_url:
+            log.info("generate_video_web: skip UI recovery without conversation binding")
+            return {
+                "videos": [],
+                "prompt": prompt,
+                "conversation_id": conversation_id,
+                "conversation_url": conversation_url,
+            }
 
         video_regex = re.compile(r"(mp4|m3u8|douyinvod|mime_type=video_mp4|video_gen)", re.I)
         prompt_snippet = (prompt or "").strip()[:48]
-        require_prompt_match = False
+        require_prompt_match = not bool(conversation_id)
         deadline = time.time() + timeout
         visited: set[str] = set()
 
@@ -2136,7 +2156,9 @@ class BrowserClient:
             return videos
 
         async def candidate_urls() -> List[str]:
-            return [f"{DOUBAO_URL}/chat/{conversation_id}"]
+            if conversation_id:
+                return [f"{DOUBAO_URL}/chat/{conversation_id}"]
+            return [bound_url]
             current = self._page.url
             links = await self._page.evaluate(
                 """() => Array.from(document.querySelectorAll('a[href*="/chat/"]'))
@@ -2167,11 +2189,21 @@ class BrowserClient:
 
         while time.time() < deadline:
             if not self._page:
-                return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
+                return {
+                    "videos": [],
+                    "prompt": prompt,
+                    "conversation_id": conversation_id,
+                    "conversation_url": conversation_url or bound_url,
+                }
             try:
                 for url in await candidate_urls():
                     if not self._page:
-                        return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
+                        return {
+                            "videos": [],
+                            "prompt": prompt,
+                            "conversation_id": conversation_id,
+                            "conversation_url": conversation_url or bound_url,
+                        }
                     if url not in visited or time.time() + 20 > deadline:
                         visited.add(url)
                     if self._page.url != url:
@@ -2183,24 +2215,36 @@ class BrowserClient:
                     videos = await extract_current_page()
                     if videos:
                         log.info("generate_video_web: collected %d video(s) from UI", len(videos))
-                        return {"videos": videos, "prompt": prompt, "conversation_id": conversation_id}
+                        return {
+                            "videos": videos,
+                            "prompt": prompt,
+                            "conversation_id": conversation_id,
+                            "conversation_url": conversation_url or bound_url,
+                        }
             except Exception as exc:
                 log.warning("generate_video_web: UI video polling attempt failed: %s", exc)
             await asyncio.sleep(10)
 
         log.info("generate_video_web: UI polling timed out without video URL")
-        return {"videos": [], "prompt": prompt, "conversation_id": conversation_id}
+        return {
+            "videos": [],
+            "prompt": prompt,
+            "conversation_id": conversation_id,
+            "conversation_url": conversation_url or bound_url,
+        }
 
     async def recover_video_result(
         self,
         prompt: str,
         conversation_id: Optional[str] = None,
+        conversation_url: Optional[str] = None,
         timeout: float = 30,
     ) -> Dict[str, Any]:
         """Recover an already accepted video from a Doubao conversation."""
         return await self._wait_for_video_result_from_ui(
             prompt,
             conversation_id=conversation_id,
+            conversation_url=conversation_url,
             timeout=timeout,
         )
 
