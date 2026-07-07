@@ -510,23 +510,25 @@ class LongCatBrowserClient:
         page = await self.require_page()
         return await page.evaluate(
             """() => {
-              const selectors = [
-                '[class*="message"]',
-                '[class*="chat"]',
-                '[class*="markdown"]',
-                '[class*="answer"]',
-                '[class*="content"]',
-                'main',
-                'article'
-              ];
-              const nodes = new Set();
-              for (const selector of selectors) {
-                for (const el of document.querySelectorAll(selector)) nodes.add(el);
-              }
+              const editor = document.querySelector(".tiptap.ProseMirror[contenteditable='true']");
+              const editorTop = editor ? editor.getBoundingClientRect().top : window.innerHeight - 180;
+              const nodes = [...document.querySelectorAll('body *')];
               const texts = [];
               for (const el of nodes) {
+                const rect = el.getBoundingClientRect();
+                if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+                if (rect.left < 280) continue;
+                if (rect.top > editorTop - 8) continue;
+                const tag = el.tagName.toLowerCase();
+                if (['svg', 'path', 'button', 'input', 'textarea'].includes(tag)) continue;
                 const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                if (text && text.length <= 4000) texts.push(text);
+                if (!text || text.length > 4000) continue;
+                const childTexts = [...el.children]
+                  .map(child => (child.innerText || child.textContent || '').replace(/\\s+/g, ' ').trim())
+                  .filter(Boolean);
+                if (childTexts.some(childText => childText === text)) continue;
+                if (childTexts.length && childTexts.join(' ').trim() === text) continue;
+                texts.push(text);
               }
               return [...new Set(texts)];
             }"""
