@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Literal
@@ -31,6 +32,7 @@ DEFAULT_CHROMIUM_EXECUTABLE_PATH = (
     or os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
 )
 DEFAULT_CHROMIUM_CHANNEL = os.environ.get("LONGCAT_CHROMIUM_CHANNEL", "").strip()
+IMAGE_SETTLE_SECONDS = float(os.environ.get("LONGCAT_IMAGE_SETTLE_SECONDS", "12"))
 
 
 class LongCatBrowserClient:
@@ -324,39 +326,103 @@ class LongCatBrowserClient:
             self._last_responses.clear()
             page = await self.require_page()
             await self.goto_home()
+            baseline_media_urls: list[str] = []
             baseline_texts = await self._dom_text_candidates()
-            await self._fill_prompt(prompt)
             if kind == "chat":
+                await self._fill_prompt(prompt, clear=True)
                 await self._prepare_plain_chat()
             else:
                 await self._select_mode(kind)
-            await self._click_send()
+                baseline_media_urls = await self._current_media_urls(kind)
+                await self._fill_prompt(prompt, clear=False)
+            await self._click_send(prompt=prompt)
             if kind == "chat":
                 result = await self._wait_for_chat(prompt=prompt, baseline_texts=baseline_texts, timeout=timeout)
             else:
-                result = await self._wait_for_media(kind=kind, timeout=timeout)
+                result = await self._wait_for_media(
+                    kind=kind,
+                    timeout=timeout,
+                    baseline_urls=baseline_media_urls,
+                )
+            result["submitted_prompt"] = prompt
             await self.save_cookies()
             return result
 
-    async def _fill_prompt(self, prompt: str) -> None:
+    async def _fill_prompt(self, prompt: str, *, clear: bool) -> None:
         page = await self.require_page()
         editor = page.locator(".tiptap.ProseMirror[contenteditable='true']").first
         await editor.wait_for(state="visible", timeout=30_000)
         await editor.click()
-        try:
-            await editor.fill("")
-        except Exception:
-            modifier = "Meta" if os.name == "posix" else "Control"
+        if clear:
+            modifier = "Meta" if sys.platform == "darwin" else "Control"
             await page.keyboard.press(f"{modifier}+A")
             await page.keyboard.press("Backspace")
-        await editor.fill(prompt)
+        await page.keyboard.insert_text(prompt)
         await page.wait_for_timeout(500)
+        actual = await self._editor_text()
+        if self._normalize_text(prompt) not in self._normalize_text(actual):
+            if clear:
+                await editor.fill(prompt)
+            else:
+                await editor.click()
+                await page.keyboard.insert_text(prompt)
+            await page.wait_for_timeout(500)
+            actual = await self._editor_text()
+        if self._normalize_text(prompt) not in self._normalize_text(actual):
+            raise RuntimeError("LongCat prompt editor did not contain the submitted prompt after filling")
 
     async def _select_mode(self, kind: str) -> None:
         page = await self.require_page()
         label = "图片生成" if kind == "image" else "视频生成"
-        await page.get_by_text(label, exact=True).click(timeout=10_000)
+        if await self._mode_chip_active(label):
+            log.info("LongCat mode selection: label=%s state=active", label)
+            return
+        clicked = await self._click_mode_text_near_editor(label)
+        if not clicked:
+            raise RuntimeError(f"LongCat mode button not found near prompt editor: {label}")
         await page.wait_for_timeout(500)
+        log.info("LongCat mode selection: label=%s state=clicked", label)
+
+    async def _mode_chip_active(self, label: str) -> bool:
+        page = await self.require_page()
+        return bool(
+            await page.evaluate(
+                """(label) => {
+                  function textOf(el) {
+                    return ((el && (el.innerText || el.textContent)) || '').replace(/\\s+/g, ' ').trim();
+                  }
+                  function visible(el) {
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  }
+                  return [...document.querySelectorAll('button,[role="button"],div,span')]
+                    .some((el) => visible(el) && textOf(el).includes(label) && textOf(el.parentElement).includes('×'));
+                }""",
+                label,
+            )
+        )
+
+    async def _click_mode_text_near_editor(self, label: str) -> bool:
+        page = await self.require_page()
+        editor = page.locator(".tiptap.ProseMirror[contenteditable='true']").first
+        editor_box = await editor.bounding_box()
+        texts = page.get_by_text(label, exact=True)
+        count = await texts.count()
+        if not editor_box:
+            return False
+        min_y = editor_box["y"] - 24
+        max_y = editor_box["y"] + editor_box["height"] + 96
+        for index in range(count - 1, -1, -1):
+            candidate = texts.nth(index)
+            box = await candidate.bounding_box()
+            if not box:
+                continue
+            center_y = box["y"] + box["height"] / 2
+            if center_y < min_y or center_y > max_y:
+                continue
+            await page.mouse.click(box["x"] + box["width"] / 2, center_y)
+            return True
+        return False
 
     async def _prepare_plain_chat(self) -> None:
         page = await self.require_page()
@@ -398,34 +464,63 @@ class LongCatBrowserClient:
         )
         await page.wait_for_timeout(500)
 
-    async def _click_send(self) -> None:
+    async def _click_send(self, *, prompt: str) -> None:
         page = await self.require_page()
+        before_url = page.url
+        before_response_count = len(self._last_responses)
         send = page.locator(".send-btn:not(.send-btn-disabled)").first
         try:
             await send.wait_for(state="visible", timeout=10_000)
             await send.click(timeout=10_000)
         except Exception:
             await page.keyboard.press("Enter")
-        await page.wait_for_timeout(1500)
+        deadline = time.monotonic() + 8
+        prompt_norm = self._normalize_text(prompt)
+        while time.monotonic() < deadline:
+            await page.wait_for_timeout(500)
+            editor_text = self._normalize_text(await self._editor_text())
+            if page.url != before_url:
+                return
+            if len(self._last_responses) > before_response_count:
+                return
+            if prompt_norm and prompt_norm not in editor_text:
+                return
+        raise RuntimeError("LongCat prompt was filled, but submit did not start")
 
-    async def _wait_for_media(self, *, kind: str, timeout: int) -> dict[str, Any]:
+    async def _wait_for_media(self, *, kind: str, timeout: int, baseline_urls: list[str] | None = None) -> dict[str, Any]:
         page = await self.require_page()
         deadline = time.monotonic() + timeout
         last_snapshot: dict[str, Any] = {}
+        best_snapshot: dict[str, Any] = {}
+        best_keys: set[str] = set()
+        first_media_at: float | None = None
+        last_change_at: float | None = None
         while time.monotonic() < deadline:
             await page.wait_for_timeout(3000)
-            snapshot = await self._collect_result_snapshot(kind)
+            snapshot = await self._collect_result_snapshot(kind, baseline_urls=baseline_urls)
             last_snapshot = snapshot
             if snapshot["urls"]:
-                return {
-                    "status": "succeeded",
-                    "kind": kind,
-                    "urls": snapshot["urls"],
-                    "conversation_id": snapshot.get("conversation_id", ""),
-                    "raw": snapshot,
-                }
+                now = time.monotonic()
+                keys = {self._media_url_key(url) for url in snapshot["urls"]}
+                if not best_snapshot or keys != best_keys:
+                    best_snapshot = snapshot
+                    best_keys = keys
+                    last_change_at = now
+                if first_media_at is None:
+                    first_media_at = now
+                    last_change_at = now
+                if kind != "image":
+                    return self._media_result(snapshot, kind)
+                stable_for = now - (last_change_at or now)
+                collected_for = now - first_media_at
+                if len(best_snapshot["urls"]) >= 4 and stable_for >= 3:
+                    return self._media_result(best_snapshot, kind)
+                if collected_for >= IMAGE_SETTLE_SECONDS and stable_for >= 3:
+                    return self._media_result(best_snapshot, kind)
             if snapshot.get("terminal_error"):
                 raise RuntimeError(snapshot["terminal_error"])
+        if best_snapshot.get("urls"):
+            return self._media_result(best_snapshot, kind)
         raise TimeoutError(f"Timed out waiting for LongCat {kind} result. Last snapshot: {last_snapshot}")
 
     async def _wait_for_chat(self, *, prompt: str, baseline_texts: list[str], timeout: int) -> dict[str, Any]:
@@ -483,7 +578,7 @@ class LongCatBrowserClient:
             "terminal_error": terminal_error,
         }
 
-    async def _collect_result_snapshot(self, kind: str) -> dict[str, Any]:
+    async def _collect_result_snapshot(self, kind: str, *, baseline_urls: list[str] | None = None) -> dict[str, Any]:
         page = await self.require_page()
         conversation_id = self._conversation_id_from_url(page.url)
         payloads = list(self._last_responses[-30:])
@@ -493,7 +588,33 @@ class LongCatBrowserClient:
                 payloads.append({"url": "session-detail", "body": detail})
             except Exception as exc:
                 payloads.append({"url": "session-detail", "error": str(exc)})
-        dom_urls = await page.evaluate(
+        dom_urls = await self._dom_media_urls()
+        media_payloads = [
+            payload
+            for payload in payloads
+            if "configList" not in str(payload.get("url", ""))
+        ]
+        urls = classify_media_urls({"payloads": media_payloads, "dom_urls": dom_urls}, kind)
+        urls = [url for url in urls if not self._is_static_asset(url)]
+        baseline_keys = {self._media_url_key(url) for url in baseline_urls or []}
+        if baseline_keys:
+            urls = [url for url in urls if self._media_url_key(url) not in baseline_keys]
+        terminal_error = self._find_terminal_error(payloads)
+        return {
+            "conversation_id": conversation_id,
+            "urls": urls,
+            "baseline_url_count": len(baseline_keys),
+            "payloads": payloads[-10:],
+            "terminal_error": terminal_error,
+        }
+
+    async def _current_media_urls(self, kind: str) -> list[str]:
+        urls = classify_media_urls({"dom_urls": await self._dom_media_urls()}, kind)
+        return [url for url in urls if not self._is_static_asset(url)]
+
+    async def _dom_media_urls(self) -> list[str]:
+        page = await self.require_page()
+        return await page.evaluate(
             """() => {
               const urls = [];
               for (const el of [...document.querySelectorAll('img,video,source,a')]) {
@@ -503,14 +624,24 @@ class LongCatBrowserClient:
               return [...new Set(urls)];
             }"""
         )
-        urls = classify_media_urls({"payloads": payloads, "dom_urls": dom_urls}, kind)
-        urls = [url for url in urls if not self._is_static_asset(url)]
-        terminal_error = self._find_terminal_error(payloads)
+
+    async def _editor_text(self) -> str:
+        page = await self.require_page()
+        return await page.evaluate(
+            """() => {
+              const editor = document.querySelector(".tiptap.ProseMirror[contenteditable='true']");
+              return editor ? (editor.innerText || editor.textContent || '') : '';
+            }"""
+        )
+
+    @staticmethod
+    def _media_result(snapshot: dict[str, Any], kind: str) -> dict[str, Any]:
         return {
-            "conversation_id": conversation_id,
-            "urls": urls,
-            "payloads": payloads[-10:],
-            "terminal_error": terminal_error,
+            "status": "succeeded",
+            "kind": kind,
+            "urls": snapshot["urls"],
+            "conversation_id": snapshot.get("conversation_id", ""),
+            "raw": snapshot,
         }
 
     async def _dom_text_candidates(self) -> list[str]:
@@ -540,7 +671,20 @@ class LongCatBrowserClient:
         url = response.url
         if "/api/v1/" not in url:
             return
-        interesting = any(key in url for key in ("task-check", "session-detail", "chat-completion", "configList"))
+        interesting = any(
+            key in url
+            for key in (
+                "chat",
+                "completion",
+                "configList",
+                "conversation",
+                "generate",
+                "image",
+                "session",
+                "task",
+                "video",
+            )
+        )
         if not interesting:
             return
         try:
@@ -641,12 +785,36 @@ class LongCatBrowserClient:
         return any(host in lowered for host in ("s3.meituan.net/static", "serverless.sankuai.com/dx-avatar"))
 
     @staticmethod
+    def _media_url_key(url: str) -> str:
+        return re.sub(r"[?#].*$", "", str(url or "")).rstrip("/")
+
+    @staticmethod
     def _find_terminal_error(payloads: list[dict[str, Any]]) -> str:
-        markers = ("失败", "无权限", "额度不足", "次数", "quota", "forbidden", "error", "页面信息已失效")
+        markers = (
+            "失败",
+            "无权限",
+            "额度不足",
+            "次数",
+            "quota",
+            "forbidden",
+            "error",
+            "页面信息已失效",
+            "temporarily unavailable",
+            "try again later",
+        )
         text = json.dumps(payloads, ensure_ascii=False).lower()
         if any(marker.lower() in text for marker in markers):
             # Do not mark every transient stream error as terminal. Return only clear provider failures.
-            for marker in ("额度不足", "无权限", "次数已用完", "quota exhausted", "quota exceeded", "页面信息已失效"):
+            for marker in (
+                "额度不足",
+                "无权限",
+                "次数已用完",
+                "quota exhausted",
+                "quota exceeded",
+                "页面信息已失效",
+                "temporarily unavailable",
+                "try again later",
+            ):
                 if marker in text:
                     return f"LongCat provider reported terminal error: {marker}"
         return ""

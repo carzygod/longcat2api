@@ -39,17 +39,18 @@ def classify_media_urls(value: Any, kind: str | None = None) -> list[str]:
     selected: list[str] = []
     for url in urls:
         lowered = url.lower()
-        is_image = bool(_IMAGE_EXT_RE.search(url)) or any(marker in lowered for marker in ("image", "img", "pic"))
-        is_video = bool(_VIDEO_EXT_RE.search(url)) or any(marker in lowered for marker in ("video", "mp4", "tos-cn"))
+        is_image = bool(_IMAGE_EXT_RE.search(url))
+        is_video = bool(_VIDEO_EXT_RE.search(url))
         if kind == "image" and not is_image:
             continue
         if kind == "video" and not is_video:
             continue
         selected.append(url)
+    if kind:
+        return selected
     return selected or urls
 
 
 def first_media_url(value: Any, kind: str | None = None) -> str:
     urls = classify_media_urls(value, kind)
     return urls[0] if urls else ""
-

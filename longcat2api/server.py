@@ -351,7 +351,8 @@ async def images(request: Request, req: ImageGenerationRequest) -> dict[str, Any
         if "not logged in" in str(exc):
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise
-    return _image_response(result["urls"][: max(1, req.n)], result)
+    result["requested_n"] = req.n
+    return _image_response(result["urls"], result)
 
 
 @app.post("/v1/chat/completions")
