@@ -106,12 +106,18 @@ async def lifespan(_: FastAPI):
         level=os.environ.get("LONGCAT_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    startup_task: asyncio.Task[None] | None = None
     if os.environ.get("LONGCAT_START_BROWSER", "true").lower() != "false":
-        try:
-            await client.start()
-        except Exception as exc:
-            log.warning("LongCat browser did not start during boot: %s", exc)
+        async def start_browser_background() -> None:
+            try:
+                await client.start()
+            except Exception as exc:
+                log.warning("LongCat browser did not start during boot: %s", exc)
+
+        startup_task = asyncio.create_task(start_browser_background())
     yield
+    if startup_task and not startup_task.done():
+        startup_task.cancel()
     await client.stop()
 
 
