@@ -460,13 +460,20 @@ class LongCatBrowserClient:
                 payloads.append({"url": "session-detail", "body": detail})
             except Exception as exc:
                 payloads.append({"url": "session-detail", "error": str(exc)})
-        payload_texts = self._payload_text_candidates(payloads)
         dom_texts = await self._dom_text_candidates()
-        candidates = self._filter_chat_candidates(
-            payload_texts + dom_texts,
+        dom_candidates = self._filter_chat_candidates(
+            dom_texts,
             prompt=prompt,
             baseline=baseline,
         )
+        payload_candidates: list[str] = []
+        if not dom_candidates:
+            payload_candidates = self._filter_chat_candidates(
+                self._payload_text_candidates(payloads),
+                prompt=prompt,
+                baseline=baseline,
+            )
+        candidates = dom_candidates or payload_candidates
         terminal_error = self._find_terminal_error(payloads)
         return {
             "conversation_id": conversation_id,
