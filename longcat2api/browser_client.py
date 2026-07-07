@@ -360,6 +360,11 @@ class LongCatBrowserClient:
 
     async def _prepare_plain_chat(self) -> None:
         page = await self.require_page()
+        try:
+            await page.get_by_text("联网搜索", exact=True).click(timeout=3000)
+            await page.wait_for_timeout(300)
+        except Exception:
+            pass
         await page.evaluate(
             """(labels) => {
               function rgbParts(value) {
@@ -563,6 +568,9 @@ class LongCatBrowserClient:
             "api 开放平台",
             "内容由ai生成",
             "已搜到",
+            "正在搜索",
+            "取消复制分享链接",
+            "复制分享链接",
             "页面信息已失效",
             "当前页面停留了太长时间",
         )
