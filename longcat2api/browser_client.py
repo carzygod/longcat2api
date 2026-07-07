@@ -470,7 +470,7 @@ class LongCatBrowserClient:
         terminal_error = self._find_terminal_error(payloads)
         return {
             "conversation_id": conversation_id,
-            "text": candidates[-1] if candidates else "",
+            "text": self._choose_chat_text(candidates),
             "candidates": candidates[-8:],
             "payloads": payloads[-10:],
             "terminal_error": terminal_error,
@@ -523,11 +523,6 @@ class LongCatBrowserClient:
                 if (['svg', 'path', 'button', 'input', 'textarea'].includes(tag)) continue;
                 const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
                 if (!text || text.length > 4000) continue;
-                const childTexts = [...el.children]
-                  .map(child => (child.innerText || child.textContent || '').replace(/\\s+/g, ' ').trim())
-                  .filter(Boolean);
-                if (childTexts.some(childText => childText === text)) continue;
-                if (childTexts.length && childTexts.join(' ').trim() === text) continue;
                 texts.push(text);
               }
               return [...new Set(texts)];
@@ -617,6 +612,12 @@ class LongCatBrowserClient:
 
         walk(payloads)
         return candidates
+
+    @staticmethod
+    def _choose_chat_text(candidates: list[str]) -> str:
+        if not candidates:
+            return ""
+        return max(candidates, key=len)
 
     @staticmethod
     def _normalize_text(text: Any) -> str:
