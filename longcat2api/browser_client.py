@@ -326,7 +326,9 @@ class LongCatBrowserClient:
             await self.goto_home()
             baseline_texts = await self._dom_text_candidates()
             await self._fill_prompt(prompt)
-            if kind != "chat":
+            if kind == "chat":
+                await self._prepare_plain_chat()
+            else:
                 await self._select_mode(kind)
             await self._click_send()
             if kind == "chat":
@@ -354,6 +356,41 @@ class LongCatBrowserClient:
         page = await self.require_page()
         label = "图片生成" if kind == "image" else "视频生成"
         await page.get_by_text(label, exact=True).click(timeout=10_000)
+        await page.wait_for_timeout(500)
+
+    async def _prepare_plain_chat(self) -> None:
+        page = await self.require_page()
+        await page.evaluate(
+            """(labels) => {
+              function rgbParts(value) {
+                const match = String(value || '').match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                return match ? match.slice(1, 4).map(Number) : [];
+              }
+              function isGreen(value) {
+                const [r, g, b] = rgbParts(value);
+                return g > 120 && g > r + 25 && g > b + 25;
+              }
+              for (const label of labels) {
+                const nodes = [...document.querySelectorAll('button,[role="button"],div,span')]
+                  .filter(el => (el.innerText || el.textContent || '').trim() === label);
+                const visible = nodes.find(el => {
+                  const rect = el.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                });
+                if (!visible) continue;
+                const target = visible.closest('button,[role="button"]') || visible;
+                const html = target.outerHTML.slice(0, 500).toLowerCase();
+                const style = getComputedStyle(target);
+                const active =
+                  /active|selected|checked|is-on|true/.test(html) ||
+                  isGreen(style.color) ||
+                  isGreen(style.borderColor) ||
+                  isGreen(style.backgroundColor);
+                if (active) target.click();
+              }
+            }""",
+            ["联网搜索", "深度思考", "深度研究"],
+        )
         await page.wait_for_timeout(500)
 
     async def _click_send(self) -> None:
@@ -516,6 +553,7 @@ class LongCatBrowserClient:
             "longcat",
             "请输入你的问题或需求",
             "开启新对话",
+            "新对话",
             "图片生成",
             "视频生成",
             "联网搜索",
@@ -524,6 +562,9 @@ class LongCatBrowserClient:
             "下载手机应用",
             "api 开放平台",
             "内容由ai生成",
+            "已搜到",
+            "页面信息已失效",
+            "当前页面停留了太长时间",
         )
         for text in texts:
             normalized = cls._normalize_text(text)
@@ -583,11 +624,11 @@ class LongCatBrowserClient:
 
     @staticmethod
     def _find_terminal_error(payloads: list[dict[str, Any]]) -> str:
-        markers = ("失败", "无权限", "额度不足", "次数", "quota", "forbidden", "error")
+        markers = ("失败", "无权限", "额度不足", "次数", "quota", "forbidden", "error", "页面信息已失效")
         text = json.dumps(payloads, ensure_ascii=False).lower()
         if any(marker.lower() in text for marker in markers):
             # Do not mark every transient stream error as terminal. Return only clear provider failures.
-            for marker in ("额度不足", "无权限", "次数已用完", "quota exhausted", "quota exceeded"):
+            for marker in ("额度不足", "无权限", "次数已用完", "quota exhausted", "quota exceeded", "页面信息已失效"):
                 if marker in text:
                     return f"LongCat provider reported terminal error: {marker}"
         return ""
