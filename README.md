@@ -242,6 +242,14 @@ Then open:
 http://<server-ip>:19091/admin?key=change-this-key
 ```
 
+If the server has slow access to PyPI, pass a mirror during build:
+
+```bash
+docker build \
+  --build-arg PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple \
+  -t longcat-web-01:latest .
+```
+
 ## Manual Python Run
 
 Use this only for development or debugging:
@@ -253,6 +261,8 @@ pip install -r requirements.txt
 playwright install chromium
 LONGCAT_API_KEY=change-this-key LONGCAT_HOST=0.0.0.0 LONGCAT_PORT=19091 python -m longcat2api
 ```
+
+For a systemd deployment, keep the repository under `/opt/longcat2api`, create a virtual environment under `/opt/longcat2api/.venv`, put runtime secrets in `/opt/longcat2api/.env.deploy`, and run `python -m longcat2api` from a `longcat-web-01.service`. If the host already has a compatible Chromium or Chrome binary, set `LONGCAT_CHROMIUM_EXECUTABLE_PATH` to that binary and skip downloading Playwright browsers again.
 
 ## Login Guide
 
