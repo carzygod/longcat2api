@@ -440,17 +440,44 @@ async function startQr(id){
   openModal("扫码登录","使用 LongCat 页面支持的登录方式扫码，扫码后本页会轮询登录态。",'<div class="empty">正在生成二维码截图...</div>');
   try{
     const data=await api(`/admin/api/accounts/${encodeURIComponent(id)}/qr-login`,{method:"POST"});
-    document.getElementById("modalBody").innerHTML=`<img src="data:image/png;base64,${data.image_base64}" /><pre style="margin-top:12px">${esc(JSON.stringify(data.status,null,2))}</pre>`;
-    pollQr(id);
+    document.getElementById("modalBody").innerHTML=`<img src="data:image/png;base64,${data.image_base64}" /><div id="qrStatus" style="margin-top:12px">${qrStatusHtml(data)}</div>`;
+    if(data.status==="confirmed"){
+      toast("登录成功");
+      await refreshAll();
+    }else{
+      pollQr(id);
+    }
   }catch(e){document.getElementById("modalBody").innerHTML=`<pre>${esc(e.message)}</pre>`}
 }
 let qrTimer=null;
+function qrStatusHtml(data){
+  const status=data.status||"waiting";
+  const ok=status==="confirmed";
+  const login=data.login_status||{};
+  const user=login.user_current?.data||{};
+  const label=ok?"已登录":"等待扫码确认";
+  const klass=ok?"ready":"warn";
+  const name=user.name||user.userId||"";
+  return `<div class="card" style="box-shadow:none;background:rgba(255,255,255,.035)">
+    <div class="actions" style="justify-content:space-between">
+      <span class="badge ${klass}">${label}</span>
+      <span class="mono">${esc(status)}</span>
+    </div>
+    <div class="subline">${name?`当前账号：${esc(name)}`:"扫码成功后这里会自动变为已登录。"}</div>
+  </div>`;
+}
 function pollQr(id){
   clearInterval(qrTimer);
   qrTimer=setInterval(async()=>{
     try{
       const data=await api(`/admin/api/accounts/${encodeURIComponent(id)}/qr-login`);
-      if(data.status==="confirmed"){clearInterval(qrTimer);toast("登录成功");await refreshAll()}
+      const target=document.getElementById("qrStatus");
+      if(target)target.innerHTML=qrStatusHtml(data);
+      if(data.status==="confirmed"){
+        clearInterval(qrTimer);
+        toast("登录成功");
+        await refreshAll();
+      }
     }catch{}
   },2500);
 }
