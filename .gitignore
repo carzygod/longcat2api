@@ -1,30 +1,82 @@
-# Sensitive session data
-.doubao_session.json
-decrypted_cookies.json
+# Secrets and runtime configuration
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# LongCat browser/session data
+data/
+browser/
+profile/
+profiles/
+longcat_session.json
+*.session.json
+decrypted_cookies.json
+cookies.json
+cookie*.txt
+longcat_qr_login.png
+
+# Runtime logs and temporary outputs
+logs/
+*.log
+server_out.txt
+server_err.txt
+*.pid
+*.sock
+*.test.*
+tmp/
+temp/
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 *.pyo
+*.pyd
 *.egg-info/
+.eggs/
 dist/
 build/
+wheelhouse/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
 .venv/
 venv/
+env/
+ENV/
+
+# Playwright artifacts
+playwright-report/
+test-results/
+traces/
+videos/
+screenshots/
+
+# Node/editor artifacts that may appear during UI work
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # IDE / Editor
 .cursor/
 .vscode/
 .idea/
-
-# Generated artifacts
-doubao_qr_login.png
-server_out.txt
-server_err.txt
-testpic.webp
-*.test.*
+*.swp
+*.swo
 
 # OS
 Thumbs.db
+Desktop.ini
 .DS_Store
+

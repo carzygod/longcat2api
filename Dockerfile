@@ -6,13 +6,15 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium
 
-COPY doubao2api/ doubao2api/
+COPY longcat2api/ longcat2api/
 
-ENV DOUBAO_HOST=0.0.0.0
-ENV DOUBAO_PORT=9090
-ENV DOUBAO_BROWSER_DATA=/app/data/browser
-ENV DOUBAO_SESSION_FILE=/app/data/.doubao_session.json
+ENV LONGCAT_HOST=0.0.0.0
+ENV LONGCAT_PORT=9090
+ENV LONGCAT_DATA_DIR=/app/data
+ENV LONGCAT_BROWSER_DATA=/app/data/browser
+ENV LONGCAT_SESSION_FILE=/app/data/longcat_session.json
 
 EXPOSE 9090
 
-CMD ["python", "-m", "doubao2api"]
+CMD ["python", "-m", "longcat2api"]
+
