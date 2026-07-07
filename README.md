@@ -11,6 +11,7 @@ The project is intended to be operated as `LONGCAT-WEB-01` in the gen2api provid
 | LongCat Web login persistence | Supported | Playwright persistent profile + saved cookies |
 | Cookie Header import | Supported | Paste raw `Cookie: name=value; ...` request header |
 | QR login screenshot | Supported | Opens LongCat login flow and returns current browser screenshot |
+| Text-to-text | Supported | Uses the normal LongCat chat box and requires assistant text output |
 | Text-to-image | Supported | Uses real Web UI flow and extracts generated media URL |
 | Text-to-video | Supported | Uses real Web UI flow and extracts generated media URL |
 | OpenAI-compatible model list | Supported | `/v1/models` |
@@ -37,6 +38,7 @@ Generation is serialized per browser profile. This avoids multiple simultaneous 
 
 | Type | Model name | Endpoint |
 | --- | --- | --- |
+| Chat | `longcat-chat` | `/v1/chat/completions` |
 | Image | `longcat-image` | `/v1/images/generations` |
 | Video | `longcat-video` | `/v1/videos` |
 | Video alias | `longcat-video-fast` | `/v1/videos` |
@@ -68,6 +70,7 @@ Example response:
 {
   "object": "list",
   "data": [
+    {"id": "longcat-chat", "object": "model", "created": 0, "owned_by": "longcat"},
     {"id": "longcat-image", "object": "model", "created": 0, "owned_by": "longcat"},
     {"id": "longcat-video", "object": "model", "created": 0, "owned_by": "longcat"},
     {"id": "longcat-video-fast", "object": "model", "created": 0, "owned_by": "longcat"}
@@ -154,7 +157,7 @@ Content-Type: application/json
 }
 ```
 
-This wrapper is intentionally thin. It extracts user/system text and calls the image or video path according to the model name. It is useful for gateways that can only route chat-completion style requests.
+For `longcat-chat`, this endpoint sends a normal text prompt through the LongCat Web chat box and returns the assistant text. For image/video model names, the wrapper still calls the corresponding media path and returns generated URLs as text content. It is useful for gateways that can only route chat-completion style requests.
 
 ## Admin WebUI
 
@@ -193,7 +196,7 @@ Recommended NewAPI channel fields:
 | Channel type | OpenAI-compatible custom channel |
 | Base URL | `http://<host>:<port>/v1` |
 | API key | `<LONGCAT_API_KEY>` |
-| Models | `longcat-image,longcat-video,longcat-video-fast` |
+| Models | `longcat-chat,longcat-image,longcat-video,longcat-video-fast` |
 | Image endpoint | `/images/generations` |
 | Video endpoint | Route according to NewAPI custom video support; direct service endpoint is `/videos` |
 
@@ -211,6 +214,7 @@ Before routing production traffic, use the Admin `接口测试` tab to confirm t
 | `LONGCAT_SESSION_FILE` | `<data>/longcat_session.json` | Saved cookie/session JSON |
 | `LONGCAT_HEADLESS` | `true` | Set `false` only when running with a visible desktop |
 | `LONGCAT_START_BROWSER` | `true` | Start browser during service boot |
+| `LONGCAT_CHAT_TIMEOUT` | `120` | Text chat wait timeout in seconds |
 | `LONGCAT_IMAGE_TIMEOUT` | `240` | Image generation wait timeout in seconds |
 | `LONGCAT_VIDEO_TIMEOUT` | `900` | Video generation wait timeout in seconds |
 | `LONGCAT_REQUEST_LOG_LIMIT` | `200` | In-memory Admin request log length |

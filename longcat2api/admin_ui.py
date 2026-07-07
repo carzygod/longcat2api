@@ -190,20 +190,21 @@ ADMIN_HTML = r"""
       <div class="split">
         <div class="card">
           <h3>接口操练场</h3>
-          <div class="subline">请求会直接走本服务的 OpenAI 兼容接口；只有拿到真实媒体 URL 才算成功。</div>
+          <div class="subline">请求会直接走本服务的 OpenAI 兼容接口；文生文需拿到模型回复，媒体生成需拿到真实 URL。</div>
           <div class="form" style="margin-top:16px">
             <label>账号
               <select id="testAccount"><option value="default">LongCat 默认账号 / default</option></select>
             </label>
             <label>模型
               <select id="testModel">
+                <option value="longcat-chat">longcat-chat / 文生文</option>
                 <option value="longcat-image">longcat-image / 文生图</option>
                 <option value="longcat-video">longcat-video / 文生视频</option>
                 <option value="longcat-video-fast">longcat-video-fast / 视频别名</option>
               </select>
             </label>
             <label>Prompt
-              <textarea id="testPrompt">生成一只可爱的猫咪图片，柔和光线，高清细节。</textarea>
+              <textarea id="testPrompt">请只回复一句：文本测试通过。</textarea>
             </label>
             <button class="btn primary" id="runTestBtn" onclick="runTest()">发送测试</button>
           </div>
@@ -273,7 +274,7 @@ const KEY="__API_KEY__";
 const API_BASE=location.origin;
 const tabs=[
   {key:"accounts",name:"账号池",sub:"维护 LongCat 登录态、Cookie 和浏览器运行状态",icon:"◎"},
-  {key:"test",name:"接口测试",sub:"快速验证文生图与文生视频路径",icon:"▣"},
+  {key:"test",name:"接口测试",sub:"快速验证文生文、文生图与文生视频路径",icon:"▣"},
   {key:"logs",name:"请求日志",sub:"查看最近请求和失败状态",icon:"≡"},
   {key:"system",name:"系统",sub:"查看路径、密钥和模型列表",icon:"⚙"}
 ];
@@ -319,7 +320,7 @@ function renderMetrics(){
     ["账号总数",state.accounts.length||1,"LongCat 默认账号池"],
     ["已登录",logged,account.runtime?.ready?"Provider ready":"等待扫码或 Cookie"],
     ["浏览器",hot,account.runtime?.page_url||state.system.browser_data||"--"],
-    ["模型数",state.models.length||3,"image / video"]
+    ["模型数",state.models.length||4,"chat / image / video"]
   ];
   document.getElementById("metrics").innerHTML=values.map(v=>`<div class="card metric"><div class="metric-label">${v[0]}</div><div class="metric-value">${v[1]}</div><div class="metric-meta">${esc(v[2])}</div></div>`).join("");
 }
@@ -504,8 +505,15 @@ async function runTest(){
   const prompt=document.getElementById("testPrompt").value.trim();
   btn.disabled=true;out.textContent="requesting...";
   try{
-    const path=model.includes("image")?"/v1/images/generations":"/v1/videos";
-    const body=model.includes("image")?{model,prompt,n:1}:{model,prompt,wait:true};
+    let path="/v1/chat/completions";
+    let body={model,messages:[{role:"user",content:prompt}]};
+    if(model.includes("image")){
+      path="/v1/images/generations";
+      body={model,prompt,n:1};
+    }else if(model.includes("video")){
+      path="/v1/videos";
+      body={model,prompt,wait:true};
+    }
     const data=await api(path,{method:"POST",body:JSON.stringify(body)});
     out.textContent=JSON.stringify(data,null,2);
   }catch(e){out.textContent=e.message}

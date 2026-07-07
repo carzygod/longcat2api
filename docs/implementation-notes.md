@@ -8,8 +8,9 @@ LongCat Web initializes Meituan H5guard with `fetchHook` and `xhrHook` for `long
 
 1. Keep a persistent browser profile in `LONGCAT_BROWSER_DATA`.
 2. Login through `/admin?key=<LONGCAT_API_KEY>` by scanning the LongCat/Meituan QR screenshot, or import a full Cookie request header.
-3. For image generation, open the LongCat home page, fill the editor, select `图片生成`, submit, then collect result URLs.
-4. For video generation, open the LongCat home page, fill the editor, select `视频生成`, submit, then collect result URLs from `task-check`, `session-detail`, and rendered DOM nodes.
+3. For normal text chat, open the LongCat home page, fill the editor, submit without selecting media mode, then collect assistant text from response payloads, session detail, and new DOM text.
+4. For image generation, open the LongCat home page, fill the editor, select `图片生成`, submit, then collect result URLs.
+5. For video generation, open the LongCat home page, fill the editor, select `视频生成`, submit, then collect result URLs from `task-check`, `session-detail`, and rendered DOM nodes.
 
 ## Verified Locators
 

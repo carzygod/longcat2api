@@ -313,7 +313,7 @@ class LongCatBrowserClient:
     async def generate(
         self,
         *,
-        kind: Literal["image", "video"],
+        kind: Literal["chat", "image", "video"],
         prompt: str,
         timeout: int,
     ) -> dict[str, Any]:
@@ -324,10 +324,15 @@ class LongCatBrowserClient:
             self._last_responses.clear()
             page = await self.require_page()
             await self.goto_home()
+            baseline_texts = await self._dom_text_candidates()
             await self._fill_prompt(prompt)
-            await self._select_mode(kind)
+            if kind != "chat":
+                await self._select_mode(kind)
             await self._click_send()
-            result = await self._wait_for_media(kind=kind, timeout=timeout)
+            if kind == "chat":
+                result = await self._wait_for_chat(prompt=prompt, baseline_texts=baseline_texts, timeout=timeout)
+            else:
+                result = await self._wait_for_media(kind=kind, timeout=timeout)
             await self.save_cookies()
             return result
 
@@ -381,6 +386,54 @@ class LongCatBrowserClient:
                 raise RuntimeError(snapshot["terminal_error"])
         raise TimeoutError(f"Timed out waiting for LongCat {kind} result. Last snapshot: {last_snapshot}")
 
+    async def _wait_for_chat(self, *, prompt: str, baseline_texts: list[str], timeout: int) -> dict[str, Any]:
+        page = await self.require_page()
+        deadline = time.monotonic() + timeout
+        baseline = {self._normalize_text(text) for text in baseline_texts}
+        last_snapshot: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            await page.wait_for_timeout(2000)
+            snapshot = await self._collect_chat_snapshot(prompt=prompt, baseline=baseline)
+            last_snapshot = snapshot
+            text = snapshot.get("text") or ""
+            if text:
+                return {
+                    "status": "succeeded",
+                    "kind": "chat",
+                    "text": text,
+                    "conversation_id": snapshot.get("conversation_id", ""),
+                    "raw": snapshot,
+                }
+            if snapshot.get("terminal_error"):
+                raise RuntimeError(snapshot["terminal_error"])
+        raise TimeoutError(f"Timed out waiting for LongCat chat result. Last snapshot: {last_snapshot}")
+
+    async def _collect_chat_snapshot(self, *, prompt: str, baseline: set[str]) -> dict[str, Any]:
+        page = await self.require_page()
+        conversation_id = self._conversation_id_from_url(page.url)
+        payloads = list(self._last_responses[-40:])
+        if conversation_id:
+            try:
+                detail = await self.browser_json("GET", f"/api/v1/session-detail?conversationId={conversation_id}")
+                payloads.append({"url": "session-detail", "body": detail})
+            except Exception as exc:
+                payloads.append({"url": "session-detail", "error": str(exc)})
+        payload_texts = self._payload_text_candidates(payloads)
+        dom_texts = await self._dom_text_candidates()
+        candidates = self._filter_chat_candidates(
+            payload_texts + dom_texts,
+            prompt=prompt,
+            baseline=baseline,
+        )
+        terminal_error = self._find_terminal_error(payloads)
+        return {
+            "conversation_id": conversation_id,
+            "text": candidates[-1] if candidates else "",
+            "candidates": candidates[-8:],
+            "payloads": payloads[-10:],
+            "terminal_error": terminal_error,
+        }
+
     async def _collect_result_snapshot(self, kind: str) -> dict[str, Any]:
         page = await self.require_page()
         conversation_id = self._conversation_id_from_url(page.url)
@@ -411,6 +464,32 @@ class LongCatBrowserClient:
             "terminal_error": terminal_error,
         }
 
+    async def _dom_text_candidates(self) -> list[str]:
+        page = await self.require_page()
+        return await page.evaluate(
+            """() => {
+              const selectors = [
+                '[class*="message"]',
+                '[class*="chat"]',
+                '[class*="markdown"]',
+                '[class*="answer"]',
+                '[class*="content"]',
+                'main',
+                'article'
+              ];
+              const nodes = new Set();
+              for (const selector of selectors) {
+                for (const el of document.querySelectorAll(selector)) nodes.add(el);
+              }
+              const texts = [];
+              for (const el of nodes) {
+                const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (text && text.length <= 4000) texts.push(text);
+              }
+              return [...new Set(texts)];
+            }"""
+        )
+
     async def _record_response(self, response: Any) -> None:
         url = response.url
         if "/api/v1/" not in url:
@@ -428,6 +507,69 @@ class LongCatBrowserClient:
             self._last_responses[:] = self._last_responses[-80:]
         except Exception:
             return
+
+    @classmethod
+    def _filter_chat_candidates(cls, texts: list[str], *, prompt: str, baseline: set[str]) -> list[str]:
+        filtered: list[str] = []
+        prompt_norm = cls._normalize_text(prompt)
+        blocked_fragments = (
+            "longcat",
+            "请输入你的问题或需求",
+            "开启新对话",
+            "图片生成",
+            "视频生成",
+            "联网搜索",
+            "深度思考",
+            "深度研究",
+            "下载手机应用",
+            "api 开放平台",
+            "内容由ai生成",
+        )
+        for text in texts:
+            normalized = cls._normalize_text(text)
+            lowered = normalized.lower()
+            if not normalized:
+                continue
+            if normalized in baseline:
+                continue
+            if prompt_norm and (normalized == prompt_norm or prompt_norm in normalized):
+                continue
+            if len(normalized) < 2:
+                continue
+            if any(fragment in lowered for fragment in blocked_fragments):
+                continue
+            if normalized not in filtered:
+                filtered.append(normalized)
+        return filtered
+
+    @classmethod
+    def _payload_text_candidates(cls, payloads: Any) -> list[str]:
+        candidates: list[str] = []
+        text_keys = {"content", "text", "answer", "message", "msg", "reply", "markdown", "delta"}
+
+        def walk(value: Any, parent_key: str = "") -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    key_text = str(key)
+                    if isinstance(item, str) and key_text.lower() in text_keys:
+                        text = cls._normalize_text(item)
+                        if text:
+                            candidates.append(text)
+                    walk(item, key_text)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item, parent_key)
+            elif isinstance(value, str) and parent_key.lower() in text_keys:
+                text = cls._normalize_text(value)
+                if text:
+                    candidates.append(text)
+
+        walk(payloads)
+        return candidates
+
+    @staticmethod
+    def _normalize_text(text: Any) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip()
 
     @staticmethod
     def _conversation_id_from_url(url: str) -> str:

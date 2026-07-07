@@ -27,6 +27,7 @@ HOST = os.environ.get("LONGCAT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("LONGCAT_PORT", "9090"))
 IMAGE_TIMEOUT = int(os.environ.get("LONGCAT_IMAGE_TIMEOUT", "240"))
 VIDEO_TIMEOUT = int(os.environ.get("LONGCAT_VIDEO_TIMEOUT", "900"))
+CHAT_TIMEOUT = int(os.environ.get("LONGCAT_CHAT_TIMEOUT", "120"))
 REQUEST_LOG_LIMIT = int(os.environ.get("LONGCAT_REQUEST_LOG_LIMIT", "200"))
 
 
@@ -54,7 +55,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "longcat-image"
+    model: str = "longcat-chat"
     messages: list[ChatMessage]
     stream: bool = False
 
@@ -177,6 +178,7 @@ def _check_auth(request: Request) -> None:
 
 def _models() -> list[dict[str, Any]]:
     return [
+        {"id": "longcat-chat", "object": "model", "created": 0, "owned_by": "longcat"},
         {"id": "longcat-image", "object": "model", "created": 0, "owned_by": "longcat"},
         {"id": "longcat-video", "object": "model", "created": 0, "owned_by": "longcat"},
         {"id": "longcat-video-fast", "object": "model", "created": 0, "owned_by": "longcat"},
@@ -289,6 +291,7 @@ def _system_payload() -> dict[str, Any]:
         "python": platform.python_version(),
         "platform": platform.platform(),
         "request_log_limit": REQUEST_LOG_LIMIT,
+        "chat_timeout": CHAT_TIMEOUT,
         "image_timeout": IMAGE_TIMEOUT,
         "video_timeout": VIDEO_TIMEOUT,
         "models": _models(),
@@ -373,8 +376,16 @@ async def chat_completions(request: Request, req: ChatCompletionRequest) -> dict
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise
         content = "\n".join(result["urls"])
+    elif req.model in {"longcat-chat", "longcat-text", "longcat"}:
+        try:
+            result = await client.generate(kind="chat", prompt=prompt, timeout=CHAT_TIMEOUT)
+        except RuntimeError as exc:
+            if "not logged in" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+        content = result["text"]
     else:
-        raise HTTPException(status_code=400, detail="longcat2api currently supports image/video models only")
+        raise HTTPException(status_code=400, detail=f"unsupported chat model: {req.model}")
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
