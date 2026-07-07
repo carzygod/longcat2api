@@ -243,13 +243,14 @@ async def _safe_login_status(*, start_if_needed: bool = True) -> dict[str, Any]:
 
 async def _account_snapshot(*, start_if_needed: bool = True) -> dict[str, Any]:
     provider = await _safe_login_status(start_if_needed=start_if_needed)
+    public_provider = _sanitize_provider_payload(provider)
     logged_in = bool(provider.get("logged_in"))
     runtime = {
         "hot": client.is_ready,
         "ready": bool(client.is_ready and logged_in),
         "page_url": client.page_url,
         "headless": client.headless,
-        "login_status": provider,
+        "login_status": public_provider,
     }
     return {
         "id": "default",
@@ -292,6 +293,37 @@ def _system_payload() -> dict[str, Any]:
         "video_timeout": VIDEO_TIMEOUT,
         "models": _models(),
     }
+
+
+def _mask_secret(value: Any) -> str:
+    text = str(value or "")
+    if len(text) <= 8:
+        return "***" if text else ""
+    return f"{text[:4]}***{text[-4:]}"
+
+
+def _mask_phone(value: Any) -> str:
+    text = str(value or "")
+    if len(text) < 7:
+        return _mask_secret(text)
+    return f"{text[:3]}****{text[-4:]}"
+
+
+def _sanitize_provider_payload(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_sanitize_provider_payload(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    sanitized: dict[str, Any] = {}
+    for key, item in value.items():
+        lowered = key.lower()
+        if lowered in {"token", "token2", "mt_c_token", "passport_token_key", "isid", "oops"}:
+            sanitized[key] = _mask_secret(item)
+        elif lowered == "phone":
+            sanitized[key] = _mask_phone(item)
+        else:
+            sanitized[key] = _sanitize_provider_payload(item)
+    return sanitized
 
 
 @app.get("/health")
@@ -394,7 +426,12 @@ async def admin(request: Request) -> str:
 @app.get("/admin/api/status")
 async def admin_status(request: Request) -> dict[str, Any]:
     _check_auth(request)
-    return {"service": "longcat2api", "browser_ready": client.is_ready, "provider": await _safe_login_status(), "models": _models()}
+    return {
+        "service": "longcat2api",
+        "browser_ready": client.is_ready,
+        "provider": _sanitize_provider_payload(await _safe_login_status()),
+        "models": _models(),
+    }
 
 
 @app.get("/admin/api/system")
@@ -452,12 +489,22 @@ async def admin_account_probe(request: Request, account_id: str) -> dict[str, An
     _require_default_account(account_id)
     status = await _safe_login_status()
     if not status.get("logged_in"):
-        return {"ok": False, "status": "login_required", "login_status": status}
+        return {"ok": False, "status": "login_required", "login_status": _sanitize_provider_payload(status)}
     try:
         config = await client.provider_config()
     except Exception as exc:
-        return {"ok": False, "status": "provider_error", "login_status": status, "error": str(exc)}
-    return {"ok": True, "status": "ready", "login_status": status, "provider_config": config}
+        return {
+            "ok": False,
+            "status": "provider_error",
+            "login_status": _sanitize_provider_payload(status),
+            "error": str(exc),
+        }
+    return {
+        "ok": True,
+        "status": "ready",
+        "login_status": _sanitize_provider_payload(status),
+        "provider_config": _sanitize_provider_payload(config),
+    }
 
 
 @app.get("/admin/api/accounts/{account_id}/cookies")
@@ -494,13 +541,14 @@ async def admin_account_qr_start(request: Request, account_id: str) -> dict[str,
     _require_default_account(account_id)
     data = await client.open_login_qr()
     logged_in = bool((data.get("status") or {}).get("logged_in"))
+    login_status = _sanitize_provider_payload(data.get("status"))
     return {
         "account_id": account_id,
         "image_base64": data.get("image_base64"),
         "page_url": data.get("page_url"),
         "status": "confirmed" if logged_in else "waiting",
         "text": "已登录" if logged_in else "等待扫码确认",
-        "login_status": data.get("status"),
+        "login_status": login_status,
     }
 
 
@@ -514,7 +562,7 @@ async def admin_account_qr_poll(request: Request, account_id: str) -> dict[str, 
         "account_id": account_id,
         "status": "confirmed" if logged_in else "waiting",
         "text": "已登录" if logged_in else "等待扫码确认",
-        "login_status": status,
+        "login_status": _sanitize_provider_payload(status),
     }
 
 
@@ -562,14 +610,14 @@ async def admin_login_qr(request: Request) -> dict[str, Any]:
 async def admin_import_cookies(request: Request, req: CookieImportRequest) -> dict[str, Any]:
     _check_auth(request)
     count = await client.import_cookie_header(req.cookie_header)
-    return {"imported": count, "status": await _safe_login_status()}
+    return {"imported": count, "status": _sanitize_provider_payload(await _safe_login_status())}
 
 
 @app.post("/admin/api/restart")
 async def admin_restart(request: Request) -> dict[str, Any]:
     _check_auth(request)
     await client.restart()
-    return {"ok": True, "status": await _safe_login_status()}
+    return {"ok": True, "status": _sanitize_provider_payload(await _safe_login_status())}
 
 
 @app.exception_handler(Exception)
