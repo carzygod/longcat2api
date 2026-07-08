@@ -17,7 +17,7 @@ The project is intended to be operated as `LONGCAT-WEB-01` in the gen2api provid
 | OpenAI-compatible model list | Supported | `/v1/models` |
 | NewAPI basic reverse proxy | Supported | Use API Base `/v1`, Bearer token, and listed models |
 | Multi-account rotation | Not implemented | Current version exposes one default persistent browser account |
-| Reference image upload | Not implemented | Needs a captured, stable LongCat upload payload before wiring |
+| Reference image upload | Supported | `image_url`, `input_image`, `reference_images`, and chat `image_url` content blocks |
 | Quota synchronization | Not implemented | LongCat Web has no stable public quota endpoint confirmed here |
 
 ## How It Works
@@ -112,6 +112,29 @@ Response shape:
 }
 ```
 
+### Image-to-Image
+
+LongCat Web currently accepts one reference image in the captured UI state. The service supports common gateway field names and uploads the first valid image to LongCat before submitting the prompt.
+
+```json
+{
+  "model": "longcat-image",
+  "prompt": "Create a new angle based on the reference image, keep the same subject and cyberpunk lighting.",
+  "image_url": "https://example.com/reference.jpg",
+  "n": 1
+}
+```
+
+Equivalent fields:
+
+```json
+{
+  "model": "longcat-image",
+  "prompt": "Create a new angle based on the reference image.",
+  "reference_images": ["https://example.com/reference.jpg"]
+}
+```
+
 ### Text-to-Video
 
 ```http
@@ -126,6 +149,25 @@ Content-Type: application/json
   "prompt": "一个白色立方体在桌面上缓慢旋转，真实摄影风格，五秒短视频。",
   "wait": true
 }
+```
+
+### Image-to-Video
+
+Use the same video endpoint with `image_url`, `input_image`, or `reference_images`.
+
+```json
+{
+  "model": "longcat-video",
+  "prompt": "Use this reference image to generate a 5 second video: the person fires the handgun, with a brief muzzle flash and recoil. No blood, no injury, no gore.",
+  "image_url": "https://example.com/reference.jpg",
+  "wait": true
+}
+```
+
+Verified HZ01 result path after polling `session-detail`:
+
+```text
+https://s3plus-bj02.sankuai.com/xiaomei-execute-result/longcat_ai_genVideo_c2ca25081bec4a6a90dc5397f2fee290
 ```
 
 Aliases:
@@ -152,7 +194,24 @@ Content-Type: application/json
 {
   "model": "longcat-image",
   "messages": [
-    {"role": "user", "content": "生成一张赛博城市夜景图片"}
+    {"role": "user", "content": "Generate a cyberpunk night street image."}
+  ]
+}
+```
+
+Reference image content blocks are also supported:
+
+```json
+{
+  "model": "longcat-video",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Generate a 5 second video from this reference image."},
+        {"type": "image_url", "image_url": {"url": "https://example.com/reference.jpg"}}
+      ]
+    }
   ]
 }
 ```
@@ -217,6 +276,9 @@ Before routing production traffic, use the Admin `接口测试` tab to confirm t
 | `LONGCAT_CHAT_TIMEOUT` | `120` | Text chat wait timeout in seconds |
 | `LONGCAT_IMAGE_TIMEOUT` | `240` | Image generation wait timeout in seconds |
 | `LONGCAT_VIDEO_TIMEOUT` | `900` | Video generation wait timeout in seconds |
+| `LONGCAT_REFERENCE_UPLOAD_TIMEOUT` | `45` | Reference image upload wait timeout in seconds |
+| `LONGCAT_REFERENCE_IMAGE_MAX_BYTES` | `26214400` | Max reference image size |
+| `LONGCAT_MAX_REFERENCE_IMAGES` | `1` | Max reference images submitted to the current LongCat Web UI |
 | `LONGCAT_REQUEST_LOG_LIMIT` | `200` | In-memory Admin request log length |
 | `LONGCAT_LOG_LEVEL` | `INFO` | Python logging level |
 | `LONGCAT_TIMEZONE` | `Asia/Shanghai` | Browser timezone |
@@ -341,5 +403,5 @@ The current implementation is intentionally conservative:
 
 - It exposes a single persistent browser account because LongCat login/captcha behavior has not yet been validated for a safe multi-profile scheduler.
 - It does not claim quota synchronization because a stable LongCat quota endpoint has not been confirmed.
-- It does not send reference images yet. That should be added only after capturing and validating the official LongCat Web upload request, including any H5guard/browser signing requirements.
+- It currently submits one reference image because the captured LongCat Web upload input is single-file. Increase `LONGCAT_MAX_REFERENCE_IMAGES` only after validating multi-image behavior in the Web UI.
 - It returns generated media URLs collected from task/session payloads and the DOM. If LongCat changes its frontend schema, update `browser_client.py` selectors and payload extraction.

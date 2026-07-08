@@ -9,8 +9,8 @@ LongCat Web initializes Meituan H5guard with `fetchHook` and `xhrHook` for `long
 1. Keep a persistent browser profile in `LONGCAT_BROWSER_DATA`.
 2. Login through `/admin?key=<LONGCAT_API_KEY>` by scanning the LongCat/Meituan QR screenshot, or import a full Cookie request header.
 3. For normal text chat, open the LongCat home page, fill the editor, submit without selecting media mode, then collect assistant text from response payloads, session detail, and new DOM text.
-4. For image generation, open the LongCat home page, fill the editor, select `图片生成`, submit, then collect result URLs.
-5. For video generation, open the LongCat home page, fill the editor, select `视频生成`, submit, then collect result URLs from `task-check`, `session-detail`, and rendered DOM nodes.
+4. For image generation, open the LongCat home page, select `图片生成`, optionally upload one reference image through the hidden upload input, fill the editor, submit, then collect result URLs.
+5. For video generation, open the LongCat home page, select `视频生成`, optionally upload one reference image through the hidden upload input, fill the editor, submit, then collect result URLs from `task-check`, `session-detail`, and rendered DOM nodes.
 
 ## Verified Locators
 
@@ -19,11 +19,12 @@ LongCat Web initializes Meituan H5guard with `fetchHook` and `xhrHook` for `long
 | Prompt editor | `.tiptap.ProseMirror[contenteditable='true']` |
 | Image mode | text `图片生成` |
 | Video mode | text `视频生成` |
+| Reference upload | `input[type='file']`, LongCat posts `/api/v1/appendix-upload` |
 | Send button | `.send-btn:not(.send-btn-disabled)` |
 
 ## Known Gaps
 
-- Reference-image upload is not wired yet. It should be added after capturing a logged-in `/api/v1/appendix-upload` payload.
+- Reference-image upload is wired for one image. The current captured LongCat input is single-file, so multi-image support needs a separate Web UI validation before raising `LONGCAT_MAX_REFERENCE_IMAGES`.
 - `longcat-video-fast` currently maps to the same Web video generation switch because the public UI does not expose a stable named model switch in the captured state.
 - Generation is serialized per browser profile to avoid conversation/result mixing.
 

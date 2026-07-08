@@ -8,10 +8,12 @@ import os
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urljoin
 
+import httpx
 from playwright.async_api import BrowserContext, Page, async_playwright
 from playwright_stealth import Stealth
 
@@ -33,6 +35,9 @@ DEFAULT_CHROMIUM_EXECUTABLE_PATH = (
 )
 DEFAULT_CHROMIUM_CHANNEL = os.environ.get("LONGCAT_CHROMIUM_CHANNEL", "").strip()
 IMAGE_SETTLE_SECONDS = float(os.environ.get("LONGCAT_IMAGE_SETTLE_SECONDS", "12"))
+REFERENCE_UPLOAD_TIMEOUT = int(os.environ.get("LONGCAT_REFERENCE_UPLOAD_TIMEOUT", "45"))
+REFERENCE_IMAGE_MAX_BYTES = int(os.environ.get("LONGCAT_REFERENCE_IMAGE_MAX_BYTES", str(25 * 1024 * 1024)))
+MAX_REFERENCE_IMAGES = int(os.environ.get("LONGCAT_MAX_REFERENCE_IMAGES", "1"))
 
 
 class LongCatBrowserClient:
@@ -318,6 +323,7 @@ class LongCatBrowserClient:
         kind: Literal["chat", "image", "video"],
         prompt: str,
         timeout: int,
+        reference_images: list[str] | None = None,
     ) -> dict[str, Any]:
         async with self._lock:
             status = await self.login_status()
@@ -334,6 +340,9 @@ class LongCatBrowserClient:
             else:
                 await self._select_mode(kind)
                 baseline_media_urls = await self._current_media_urls(kind)
+                if reference_images:
+                    await self._upload_reference_images(reference_images)
+                    baseline_media_urls.extend(await self._current_media_urls(kind))
                 await self._fill_prompt(prompt, clear=False)
             await self._click_send(prompt=prompt)
             if kind == "chat":
@@ -345,8 +354,69 @@ class LongCatBrowserClient:
                     baseline_urls=baseline_media_urls,
                 )
             result["submitted_prompt"] = prompt
+            result["reference_images"] = reference_images or []
             await self.save_cookies()
             return result
+
+    async def _upload_reference_images(self, references: list[str]) -> None:
+        page = await self.require_page()
+        selected = [item for item in references if str(item or "").strip()][:MAX_REFERENCE_IMAGES]
+        if not selected:
+            return
+        files: list[str] = []
+        try:
+            for reference in selected:
+                files.append(await self._materialize_reference_image(reference))
+            file_input = page.locator("input[type='file']").first
+            await file_input.wait_for(state="attached", timeout=30_000)
+            for file_path in files:
+                try:
+                    async with page.expect_response(
+                        lambda response: "/api/v1/appendix-upload" in response.url,
+                        timeout=REFERENCE_UPLOAD_TIMEOUT * 1000,
+                    ):
+                        await file_input.set_input_files(file_path)
+                except Exception:
+                    await file_input.set_input_files(file_path)
+                    await page.wait_for_timeout(5000)
+                await page.wait_for_timeout(1500)
+        finally:
+            for file_path in files:
+                try:
+                    Path(file_path).unlink()
+                except Exception:
+                    pass
+
+    async def _materialize_reference_image(self, reference: str) -> str:
+        value = str(reference or "").strip()
+        if not value:
+            raise RuntimeError("empty reference image")
+        upload_dir = Path(data_root()) / "reference_uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        if value.startswith("data:image/"):
+            header, _, payload = value.partition(",")
+            if not payload:
+                raise RuntimeError("invalid data URL reference image")
+            image_bytes = base64.b64decode(payload) if ";base64" in header else payload.encode("utf-8")
+            ext = self._extension_from_content_type(header.split(";", 1)[0].removeprefix("data:"))
+        elif value.startswith("http://") or value.startswith("https://"):
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60) as http:
+                response = await http.get(value)
+                response.raise_for_status()
+                image_bytes = response.content
+                ext = self._extension_from_reference(value, response.headers.get("content-type", ""))
+        else:
+            path = Path(value)
+            if not path.exists() or not path.is_file():
+                raise RuntimeError(f"reference image is not a valid URL or file path: {value[:120]}")
+            if path.stat().st_size > REFERENCE_IMAGE_MAX_BYTES:
+                raise RuntimeError("reference image exceeds size limit")
+            return str(path)
+        if len(image_bytes) > REFERENCE_IMAGE_MAX_BYTES:
+            raise RuntimeError("reference image exceeds size limit")
+        target = upload_dir / f"reference-{uuid.uuid4().hex}{ext}"
+        target.write_bytes(image_bytes)
+        return str(target)
 
     async def _fill_prompt(self, prompt: str, *, clear: bool) -> None:
         page = await self.require_page()
@@ -783,6 +853,26 @@ class LongCatBrowserClient:
     def _is_static_asset(url: str) -> bool:
         lowered = url.lower()
         return any(host in lowered for host in ("s3.meituan.net/static", "serverless.sankuai.com/dx-avatar"))
+
+    @staticmethod
+    def _extension_from_content_type(content_type: str) -> str:
+        lowered = content_type.lower().split(";", 1)[0].strip()
+        return {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+            "image/bmp": ".bmp",
+        }.get(lowered, ".jpg")
+
+    @classmethod
+    def _extension_from_reference(cls, reference: str, content_type: str) -> str:
+        path = reference.split("?", 1)[0].split("#", 1)[0].lower()
+        for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
+            if path.endswith(ext):
+                return ".jpg" if ext == ".jpeg" else ext
+        return cls._extension_from_content_type(content_type)
 
     @staticmethod
     def _media_url_key(url: str) -> str:

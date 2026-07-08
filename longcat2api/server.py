@@ -37,6 +37,9 @@ class ImageGenerationRequest(BaseModel):
     n: int = 1
     size: str | None = "1024x1024"
     response_format: str | None = "url"
+    image_url: Any | None = None
+    input_image: Any | None = None
+    reference_images: Any | None = None
 
 
 class VideoGenerationRequest(BaseModel):
@@ -47,6 +50,9 @@ class VideoGenerationRequest(BaseModel):
     duration: int | None = None
     size: str | None = None
     ratio: str | None = None
+    image_url: Any | None = None
+    input_image: Any | None = None
+    reference_images: Any | None = None
 
 
 class ChatMessage(BaseModel):
@@ -69,10 +75,11 @@ class ServiceKeyUpdate(BaseModel):
 
 
 class _Task:
-    def __init__(self, *, task_id: str, kind: Literal["image", "video"], prompt: str) -> None:
+    def __init__(self, *, task_id: str, kind: Literal["image", "video"], prompt: str, reference_images: list[str] | None = None) -> None:
         self.task_id = task_id
         self.kind = kind
         self.prompt = prompt
+        self.reference_images = reference_images or []
         self.created = int(time.time())
         self.updated = self.created
         self.status = "queued"
@@ -87,6 +94,7 @@ class _Task:
             "updated": self.updated,
             "status": self.status,
             "prompt": self.prompt,
+            "reference_images": self.reference_images,
             "result": self.result,
             "error": self.error or None,
         }
@@ -185,8 +193,36 @@ def _models() -> list[dict[str, Any]]:
     ]
 
 
-def _prompt_from_messages(messages: list[ChatMessage]) -> str:
+def _extract_reference_images(*values: Any) -> list[str]:
+    refs: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            text = value.strip()
+            if text and text not in seen:
+                seen.add(text)
+                refs.append(text)
+            return
+        if isinstance(value, dict):
+            for key in ("url", "image_url", "input_image", "reference_image"):
+                if key in value:
+                    add(value.get(key))
+            return
+        if isinstance(value, list):
+            for item in value:
+                add(item)
+
+    for item in values:
+        add(item)
+    return refs
+
+
+def _prompt_and_references_from_messages(messages: list[ChatMessage]) -> tuple[str, list[str]]:
     parts: list[str] = []
+    refs: list[str] = []
     for msg in messages:
         if msg.role not in {"user", "system"}:
             continue
@@ -196,7 +232,13 @@ def _prompt_from_messages(messages: list[ChatMessage]) -> str:
             for item in msg.content:
                 if isinstance(item, dict) and item.get("type") in {"text", "input_text"}:
                     parts.append(str(item.get("text") or ""))
-    return "\n".join(part for part in parts if part).strip()
+                elif isinstance(item, dict) and item.get("type") in {"image_url", "input_image"}:
+                    refs.extend(_extract_reference_images(item.get("image_url"), item.get("input_image"), item.get("url")))
+                else:
+                    refs.extend(_extract_reference_images(item))
+        elif isinstance(msg.content, dict):
+            refs.extend(_extract_reference_images(msg.content))
+    return "\n".join(part for part in parts if part).strip(), _extract_reference_images(refs)
 
 
 def _image_response(urls: list[str], raw: dict[str, Any]) -> dict[str, Any]:
@@ -224,7 +266,12 @@ async def _run_task(task: _Task) -> None:
     task.status = "in_progress"
     task.updated = int(time.time())
     try:
-        result = await client.generate(kind=task.kind, prompt=task.prompt, timeout=VIDEO_TIMEOUT if task.kind == "video" else IMAGE_TIMEOUT)
+        result = await client.generate(
+            kind=task.kind,
+            prompt=task.prompt,
+            timeout=VIDEO_TIMEOUT if task.kind == "video" else IMAGE_TIMEOUT,
+            reference_images=task.reference_images,
+        )
         task.result = _video_response(result["urls"], result) if task.kind == "video" else _image_response(result["urls"], result)
         task.status = "succeeded"
     except Exception as exc:
@@ -345,8 +392,9 @@ async def images(request: Request, req: ImageGenerationRequest) -> dict[str, Any
     _check_auth(request)
     if req.model not in {"longcat-image", "longcat"}:
         raise HTTPException(status_code=400, detail=f"unsupported image model: {req.model}")
+    reference_images = _extract_reference_images(req.image_url, req.input_image, req.reference_images)
     try:
-        result = await client.generate(kind="image", prompt=req.prompt, timeout=IMAGE_TIMEOUT)
+        result = await client.generate(kind="image", prompt=req.prompt, timeout=IMAGE_TIMEOUT, reference_images=reference_images)
     except RuntimeError as exc:
         if "not logged in" in str(exc):
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -358,12 +406,12 @@ async def images(request: Request, req: ImageGenerationRequest) -> dict[str, Any
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, req: ChatCompletionRequest) -> dict[str, Any]:
     _check_auth(request)
-    prompt = _prompt_from_messages(req.messages)
+    prompt, reference_images = _prompt_and_references_from_messages(req.messages)
     if not prompt:
         raise HTTPException(status_code=400, detail="empty prompt")
     if "video" in req.model:
         try:
-            result = await client.generate(kind="video", prompt=prompt, timeout=VIDEO_TIMEOUT)
+            result = await client.generate(kind="video", prompt=prompt, timeout=VIDEO_TIMEOUT, reference_images=reference_images)
         except RuntimeError as exc:
             if "not logged in" in str(exc):
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -371,7 +419,7 @@ async def chat_completions(request: Request, req: ChatCompletionRequest) -> dict
         content = "\n".join(result["urls"])
     elif "image" in req.model:
         try:
-            result = await client.generate(kind="image", prompt=prompt, timeout=IMAGE_TIMEOUT)
+            result = await client.generate(kind="image", prompt=prompt, timeout=IMAGE_TIMEOUT, reference_images=reference_images)
         except RuntimeError as exc:
             if "not logged in" in str(exc):
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -403,16 +451,17 @@ async def videos(request: Request, req: VideoGenerationRequest) -> dict[str, Any
     _check_auth(request)
     if req.model not in {"longcat-video", "longcat-video-fast", "longcat"}:
         raise HTTPException(status_code=400, detail=f"unsupported video model: {req.model}")
+    reference_images = _extract_reference_images(req.image_url, req.input_image, req.reference_images)
     if req.wait:
         try:
-            result = await client.generate(kind="video", prompt=req.prompt, timeout=VIDEO_TIMEOUT)
+            result = await client.generate(kind="video", prompt=req.prompt, timeout=VIDEO_TIMEOUT, reference_images=reference_images)
         except RuntimeError as exc:
             if "not logged in" in str(exc):
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise
         return _video_response(result["urls"], result)
     task_id = f"longcat-video-{uuid.uuid4().hex}"
-    task = _Task(task_id=task_id, kind="video", prompt=req.prompt)
+    task = _Task(task_id=task_id, kind="video", prompt=req.prompt, reference_images=reference_images)
     tasks[task_id] = task
     asyncio.create_task(_run_task(task))
     return task.to_dict()

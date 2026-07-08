@@ -7,6 +7,7 @@ from typing import Any, Iterable
 _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.I)
 _IMAGE_EXT_RE = re.compile(r"\.(?:png|jpe?g|webp|gif|bmp)(?:[?#].*)?$", re.I)
 _VIDEO_EXT_RE = re.compile(r"\.(?:mp4|mov|webm|m3u8)(?:[?#].*)?$", re.I)
+_VIDEO_HINT_RE = re.compile(r"(?:longcat_ai_genvideo|genvideo)", re.I)
 
 
 def walk_values(value: Any) -> Iterable[Any]:
@@ -40,7 +41,7 @@ def classify_media_urls(value: Any, kind: str | None = None) -> list[str]:
     for url in urls:
         lowered = url.lower()
         is_image = bool(_IMAGE_EXT_RE.search(url))
-        is_video = bool(_VIDEO_EXT_RE.search(url))
+        is_video = bool(_VIDEO_EXT_RE.search(url) or _VIDEO_HINT_RE.search(url))
         if kind == "image" and not is_image:
             continue
         if kind == "video" and not is_video:

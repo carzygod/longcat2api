@@ -30,6 +30,7 @@ server_err.txt
 *.test.*
 tmp/
 temp/
+tmp-longcat*.png
 
 # Python
 __pycache__/
@@ -79,4 +80,3 @@ pnpm-debug.log*
 Thumbs.db
 Desktop.ini
 .DS_Store
-
